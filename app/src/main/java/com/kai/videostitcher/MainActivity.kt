@@ -386,7 +386,10 @@ class MainActivity : AppCompatActivity() {
                 setGroupState(group, "无损模式失败（${t.message ?: "格式不兼容"}），尝试其它方式…", null)
             }
         }
-        if (paramsUniform && isMp4MuxCompatible(infos)) {
+        // 无损转封装只处理无旋转元数据的组：转封装走 media3 的序列管线，
+        // 对旋转元数据的携带在真机上不可靠（带旋转的组请用 MP4/MOV 原件走
+        // 上面的无损拼接，旋转矩阵在容器层原样保留）
+        if (paramsUniform && isMp4MuxCompatible(infos) && infos.all { it.rotation == 0 }) {
             // 参数一致且编码能直封进 MP4（任意容器，含 MKV/WebM/TS/AV1）：
             // 先试无损转封装（拷贝压缩流，不解码不重编码），失败再转码
             try {
@@ -399,26 +402,15 @@ class MainActivity : AppCompatActivity() {
                 setGroupState(group, "✓ 完成（无损转封装，无重编码）", 100)
                 return outUri
             } catch (t: Throwable) {
-                android.util.Log.e(TAG, "transmux failed, falling back to transcode", t)
-                setGroupState(group, "转封装失败（${t.message ?: "格式不兼容"}），改用转码…", null)
+                android.util.Log.e(TAG, "transmux failed", t)
+                setGroupState(group, "转封装失败（${t.message ?: "格式不兼容"}）…", null)
             }
         }
-        if (hasAv1 && !hasAv1Decoder()) {
-            throw IllegalStateException("本机没有 AV1 解码器，无法重新编码混拼。请把这些 AV1 视频单独成一组（编码相同时会自动走无损转封装，不需要解码器）")
-        }
-        try {
-            val note = transcodeConcat(this@MainActivity, group.items, infos, outUri) { p ->
-                setGroupState(group, "转码拼接中 $p%（各视频参数不一致，正在重新编码，请耐心等待）", p)
-            }
-            val rotNote = if (infos.map { it.rotation }.distinct().size > 1)
-                "（组内视频拍摄方向不同，输出以等比缩放+黑边合成，请用主流播放器播放）" else ""
-            setGroupState(group, "✓ 完成（转码拼接）$note$rotNote", 100)
-        } catch (t: Throwable) {
-            android.util.Log.e(TAG, "transcode failed", t)
-            runCatching { contentResolver.delete(outUri, null, null) }
-            throw IllegalStateException(failureDetail(t, infos))
-        }
-        return outUri
+        // 走到这里 = 组内参数不一致或引擎处理不了。本 App 刻意不做转码：
+        // 真机上重新编码产出过无法播放/拉伸错乱的成品（1.2~1.3.1 的教训），
+        // 宁可中止让用户自行处理，也绝不交付坏文件
+        runCatching { contentResolver.delete(outUri, null, null) }
+        throw IllegalStateException(inconsistentAdvice(infos))
     }
 
     private fun setGroupState(group: Group, text: String, progress: Int?) {

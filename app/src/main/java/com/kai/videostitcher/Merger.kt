@@ -2,7 +2,6 @@ package com.kai.videostitcher
 
 import android.content.ContentValues
 import android.content.Context
-import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -10,23 +9,17 @@ import android.net.Uri
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
-import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
-import androidx.media3.effect.Presentation
-import androidx.media3.effect.ScaleAndRotateTransformation
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.EditedMediaItemSequence
-import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -45,10 +38,9 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
-import java.util.concurrent.atomic.AtomicIntegerArray
 
-/** 全局导出闸门：任何 Transformer 导出（转封装/转码/分段）最多 2 路并发，匹配手机
- *  硬件编码器实例数；mp4parser 无损拼接只吃 IO，不占闸门，可任意并行。 */
+/** 全局导出闸门：Transformer 导出（转封装）最多 2 路并发，匹配手机硬件编码器实例数；
+ *  mp4parser 无损拼接只吃 IO，不占闸门，可任意并行。 */
 private val exportGate = Semaphore(2)
 
 /** 临时文件/目录唯一名：纯毫秒时间戳在多分组并行时会同毫秒撞名，互相删文件 */
@@ -82,14 +74,6 @@ private fun MediaFormat.floatValue(key: String): Float =
     runCatching { getFloat(key) }
         .recoverCatching { getInteger(key).toFloat() }
         .getOrDefault(0f)
-
-/** 本机是否有 AV1 (video/av01) 解码器；没有时 AV1 无法参与转码混拼 */
-fun hasAv1Decoder(): Boolean = try {
-    MediaCodecList(MediaCodecList.REGULAR_CODECS)
-        .findDecoderForFormat(MediaFormat.createVideoFormat("video/av01", 1920, 1080)) != null
-} catch (t: Throwable) {
-    false
-}
 
 /** media3 Mp4Muxer 支持直封进 MP4 的编码（无损转封装只对这些编码可行） */
 private val muxableVideo =
@@ -155,9 +139,38 @@ fun failureDetail(t: Throwable, infos: List<TrackInfo>): String {
 }
 
 /**
- * 引擎读不动的文件（错误码 1000/1001/2xxx 一类容器层问题）不做自动修复：
- * 转码直接失败中止，由错误提示引导用户自行转码成普通 MP4 后再导入。
- * （1.2 曾内置 MediaExtractor→MediaMuxer 自动修复重封装，1.3 应用户要求回退。）
+ * 组内无法无损拼接时的中止提示：说清楚差在哪，并给出可操作的自助建议。
+ * 本 App 刻意不做转码——真机上重新编码不可控（实测会产出拉伸、错乱甚至
+ * 无法播放的成品，详见 1.3/1.3.1 两版的教训），无损拼接的成品则永远是
+ * 原画质拷贝，宁可中止也不产出坏文件。
+ */
+fun inconsistentAdvice(infos: List<TrackInfo>): String {
+    val sb = StringBuilder()
+    val unreadable = infos.count { it.videoMime == null }
+    if (unreadable > 0) {
+        sb.append("有 $unreadable 个视频本机读不动（编码特殊或封装不规范）。")
+    } else {
+        sb.append("本组视频参数不一致，无法无损拼接。")
+        val codecs = infos.map { it.videoMime!!.substringAfter('/').uppercase() }.distinct()
+        val dims = infos.map { "${it.width}x${it.height}" }.distinct()
+        val rots = infos.map { it.rotation }.distinct()
+        val audioSig = infos.map { if (it.hasAudio) "${it.audioMime}/${it.sampleRate}/${it.channels}" else "无声" }.distinct()
+        if (codecs.size > 1) sb.append("编码不同（").append(codecs.joinToString("、")).append("）；")
+        if (dims.size > 1) sb.append("分辨率不同（").append(dims.joinToString("、")).append("）；")
+        if (rots.size > 1) sb.append("拍摄方向不同；")
+        if (audioSig.size > 1) sb.append("音频不一致（").append(audioSig.joinToString("、")).append("）；")
+    }
+    sb.append("请把这些视频自行转码成参数一致的普通 MP4（推荐 H.264+AAC、同一分辨率）后再导入，")
+        .append("或按来源分成参数一致的多个分组分别拼接")
+    return sb.toString()
+}
+
+/**
+ * 引擎处理不了的文件不做自动修复也不做转码：直接中止，由错误提示引导用户
+ * 自行转码成普通 MP4 后再导入。
+ * （1.2 曾内置 MediaExtractor→MediaMuxer 自动修复重封装，1.3 应用户要求回退；
+ *  1.4 起进一步移除全部转码路径——真机上转码产出过无法播放/拉伸错乱的成品，
+ *  参数不一致的分组一律中止并提示，详见 inconsistentAdvice。）
  */
 
 /**
@@ -352,40 +365,9 @@ private fun appendAndWrite(movies: List<Movie>, outPfd: ParcelFileDescriptor) {
     }
 }
 
-/** 把本地 mp4 文件按顺序无损拼接写入 outPfd（用于分段并行转码的产物合并） */
-private fun concatMp4Files(files: List<File>, outPfd: ParcelFileDescriptor) {
-    val opened = mutableListOf<AutoCloseable>()
-    try {
-        val parser = boxParser ?: throw IllegalStateException("box parser 未初始化")
-        val movies = files.map { f ->
-            val boxChannel = FileInputStream(f).channel
-            val dataChannel = FileInputStream(f).channel
-            opened.add(boxChannel)
-            opened.add(dataChannel)
-            val isoFile = IsoFile(boxChannel, parser)
-            val movie = Movie()
-            for (trackBox in isoFile.movieBox.getBoxes(TrackBox::class.java)) {
-                movie.addTrack(
-                    Mp4TrackImpl(
-                        trackBox.trackHeaderBox.trackId,
-                        isoFile,
-                        ChannelRandomAccessSource(dataChannel),
-                        f.name
-                    )
-                )
-            }
-            movie.matrix = isoFile.movieBox.movieHeaderBox.matrix
-            movie
-        }
-        appendAndWrite(movies, outPfd)
-    } finally {
-        for (c in opened) runCatching { c.close() }
-    }
-}
-
 /**
  * 无损转封装：参数一致的组（任意容器如 MKV/WebM/TS）用 Transformer 的
- * transmux 模式直接拷贝压缩流，不重新编码。失败时由调用方回退到全转码。
+ * transmux 模式直接拷贝压缩流，不重新编码。失败时由调用方中止并提示。
  */
 suspend fun transmuxConcat(
     context: Context,
@@ -404,7 +386,7 @@ suspend fun transmuxConcat(
             .setTransmuxVideo(true)
             .build()
 
-        exportComposition(context, composition, tmp, forceAvc = false, forceAac = false, onProgress = onProgress)
+        exportComposition(context, composition, tmp, onProgress = onProgress)
         copyTmpToOut(context, tmp, outUri)
     } finally {
         tmp.delete()
@@ -414,28 +396,22 @@ suspend fun transmuxConcat(
 /**
  * 统一的 Transformer 导出入口：持有全局导出闸门（最多 2 路并发），
  * 在主线程构建/启动 Transformer 并轮询进度。
- * forceAvc/forceAac：转码时固定输出 H264/AAC——media3 的输出编码会跟随输入，
- * AV1 等编码会落到软件编码器上（极慢），固定 H264 永远走硬件编码器且兼容性最好。
  */
 private suspend fun exportComposition(
     context: Context,
     composition: Composition,
     tmp: File,
-    forceAvc: Boolean,
-    forceAac: Boolean,
     onProgress: (Int) -> Unit
 ) {
     exportGate.withPermit {
         tmp.delete()
         val finished = CompletableDeferred<Unit>()
         val transformer = withContext(Dispatchers.Main) {
-            val builder = Transformer.Builder(context)
-            if (forceAvc) builder.setVideoMimeType("video/avc")
-            if (forceAac) builder.setAudioMimeType("audio/mp4a-latm")
             // 官方 Troubleshooting 建议：芯片上 MediaCodec 偶发卡顿时，默认 10s 的
-            // muxer 间隔超时会把慢导出（如软解 4K AV1）误判为卡死而中止，放宽到 60s
-            builder.setMaxDelayBetweenMuxerSamplesMs(60_000)
-            val t = builder.build()
+            // muxer 间隔超时会把慢导出误判为卡死而中止，放宽到 60s
+            val t = Transformer.Builder(context)
+                .setMaxDelayBetweenMuxerSamplesMs(60_000)
+                .build()
             t.addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                     finished.complete(Unit)
@@ -479,213 +455,6 @@ private fun copyTmpToOut(context: Context, tmp: File, outUri: Uri) {
     }
 }
 
-/**
- * 转码拼接兜底：Media3 Transformer 解码后重新编码，能处理参数不一致、
- * 不同容器（mkv/webm 等）的混合输入。输出固定 H264/AAC，高度取组内最小
- * 高度（不超过 1080），HDR 自动压成 SDR。
- * 引擎读不动的文件（错误码 1000/1001/2xxx）不做自动修复：直接失败中止，
- * 由错误提示引导用户自行转码成普通 MP4 后再导入。
- */
-suspend fun transcodeConcat(
-    context: Context,
-    items: List<VideoItem>,
-    infos: List<TrackInfo>,
-    outUri: Uri,
-    onProgress: (Int) -> Unit
-): String {
-    val targetHeight = (infos.map { it.height }.filter { it > 0 }.minOrNull() ?: 720)
-        .coerceAtMost(1080)
-    // 组内有的视频有音轨、有的没有时，Transformer 无法混拼，统一去掉音频保成功率
-    val mixedAudio = infos.map { it.hasAudio }.distinct().size > 1
-    val first = infos.first()
-    // 音频参数完全一致且都是 AAC（或整组无声）时直接拷贝音轨，省一整遍音频编解码
-    val audioPassthrough = !mixedAudio && infos.all {
-        it.audioMime == first.audioMime &&
-            it.sampleRate == first.sampleRate &&
-            it.channels == first.channels
-    } && (first.audioMime == null || first.audioMime == "audio/mp4a-latm")
-    val audioUniform = !mixedAudio && infos.all {
-        it.audioMime == first.audioMime &&
-            it.sampleRate == first.sampleRate &&
-            it.channels == first.channels
-    }
-    val rotationsUniform = infos.all { it.rotation == first.rotation }
-    // 分段拼接要求每个片段编码后尺寸完全一致（mp4parser 同一条轨不允许不同宽高）
-    val dimsUniform = infos.all { it.width > 0 && it.width == first.width && it.height == first.height }
-    // 编码也必须一致：分段是相互独立的编码会话，mp4parser 拼接只保留第一段的
-    // 解码配置；真机硬件编码器下 H.265 与 H.264 段的参数集（SPS/PPS/色彩信息）
-    // 常有差异，拼出来会解不动（模拟器软编码输出一致，测不出来）。编码不同的
-    // 组一律走单路连续导出，整条输出只有一个参数集，天生安全。
-    val codecsUniform = infos.all { it.videoMime == first.videoMime }
-
-    // 画布策略：组内显示尺寸或旋转不一致时，所有视频统一等比缩放进同一画布
-    //（LAYOUT_SCALE_TO_FIT 保持比例、黑边补齐）。带旋转元数据的视频先显式反向旋转，
-    // 把旋转烤进像素——media3 多项序列对旋转元数据的处理不可靠（实测会转置编码方向
-    // 又丢掉 displaymatrix，画面横竖颠倒/拉伸，androidx/media#2788 一类），必须烤死。
-    val needsCanvas = !dimsUniform || !rotationsUniform
-    val effectFor: (Int) -> Effects? = if (needsCanvas) {
-        val aspect = if (first.height > 0) first.width.toDouble() / first.height else 16.0 / 9.0
-        var canvasH = targetHeight
-        if (canvasH % 2 != 0) canvasH -= 1 // 编码器普遍要求宽高为偶数，奇数高度会无法播放
-        if (canvasH < 2) canvasH = 2
-        var canvasW = (canvasH * aspect).toInt()
-        if (canvasW % 2 != 0) canvasW -= 1
-        if (canvasW < 2) canvasW = 2
-        { i ->
-            val info = infos.getOrNull(i)
-            val list = mutableListOf<Effect>()
-            if (info != null && info.rotation != 0) {
-                list.add(ScaleAndRotateTransformation.Builder().setRotationDegrees(-info.rotation.toFloat()).build())
-            }
-            list.add(Presentation.createForWidthAndHeight(canvasW, canvasH, Presentation.LAYOUT_SCALE_TO_FIT))
-            Effects(emptyList(), list)
-        }
-    } else {
-        { i ->
-            val h = infos[i].height
-            if (h == 0 || h != targetHeight) {
-                Effects(emptyList(), listOf(Presentation.createForHeight(targetHeight)))
-            } else null
-        }
-    }
-
-    // 尺寸/旋转/编码一致时按视频逐个"分段并行转码"（2 路硬件编码器同时跑）再无损拼接，
-    // 提速约一半；任一条件不满足（含混合编码）走整组单路导出（统一画布）。音频参数不一致
-    //（如 MP3 混 AAC）时片段音轨无法无损相接，同样回退整组单路。
-    // 分段成品必须过自检：真机同编码也可能因色彩信息不同产出坏文件，
-    // 自检不过自动降级单路重拼，宁可慢不可坏。
-    val expectedDurationMs = items.sumOf { it.durationMs }
-    if (items.size >= 2 && dimsUniform && rotationsUniform && codecsUniform && (mixedAudio || audioUniform)) {
-        try {
-            android.util.Log.i("VideoStitcher", "分段并行转码 ${items.size} 段")
-            val note = transcodeParallelSegments(
-                context, items, infos, effectFor, mixedAudio, audioPassthrough, outUri, onProgress
-            )
-            verifyOutputUsable(context, outUri, expectedDurationMs)?.let {
-                android.util.Log.e("VideoStitcher", "分段成品自检未通过（$it），降级单路转码")
-                throw IllegalStateException(it)
-            }
-            return note
-        } catch (t: Throwable) {
-            android.util.Log.e("VideoStitcher", "分段并行转码不可用，回退单路转码", t)
-        }
-    }
-    val note = transcodeSingle(
-        context, items, infos, effectFor, mixedAudio, audioPassthrough, outUri, onProgress, expectedDurationMs
-    )
-    verifyOutputUsable(context, outUri, expectedDurationMs)?.let { reason ->
-        runCatching { context.contentResolver.delete(outUri, null, null) }
-        throw IllegalStateException(
-            "成品自检未通过（$reason）。这个分组在本机拼不出可播放的文件，" +
-                "请把组内视频自行转码成普通 MP4 后重新导入"
-        )
-    }
-    return note
-}
-
-/** 单路转码：整组一次 Transformer 导出（effectFor 决定每个视频的缩放效果） */
-private suspend fun transcodeSingle(
-    context: Context,
-    items: List<VideoItem>,
-    infos: List<TrackInfo>,
-    effectFor: (Int) -> Effects?,
-    mixedAudio: Boolean,
-    audioPassthrough: Boolean,
-    outUri: Uri,
-    onProgress: (Int) -> Unit,
-    expectedDurationMs: Long
-): String {
-    val tmp = File(context.getExternalFilesDir(null), uniqueTempName("转码临时", ".mp4"))
-    try {
-        suspend fun buildComposition(passthroughAudio: Boolean): Composition {
-            val editedItems = items.mapIndexed { index, item ->
-                val builder = EditedMediaItem.Builder(MediaItem.fromUri(item.uri))
-                effectFor(index)?.let { builder.setEffects(it) }
-                if (mixedAudio) builder.setRemoveAudio(true)
-                builder.build()
-            }
-            return Composition.Builder(EditedMediaItemSequence.Builder(editedItems).build())
-                .apply { if (passthroughAudio) setTransmuxAudio(true) }
-                .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL)
-                .build()
-        }
-        try {
-            exportComposition(
-                context, buildComposition(audioPassthrough), tmp,
-                forceAvc = true, forceAac = !audioPassthrough && !mixedAudio, onProgress = onProgress
-            )
-        } catch (t: Throwable) {
-            if (!audioPassthrough) throw t
-            android.util.Log.e("VideoStitcher", "音频直通导出失败，改回音频重编码重试", t)
-            exportComposition(
-                context, buildComposition(false), tmp,
-                forceAvc = true, forceAac = !mixedAudio, onProgress = onProgress
-            )
-        }
-        copyTmpToOut(context, tmp, outUri)
-        // 单路导出是最后的兜底手段，成品必须自检通过；不过就中止而不是交付坏文件
-        verifyOutputUsable(context, outUri, expectedDurationMs)?.let { reason ->
-            throw IllegalStateException("转码成品自检未通过：$reason")
-        }
-    } finally {
-        tmp.delete()
-    }
-    return if (mixedAudio) "（注：组内部分视频没有声音，成品已去掉全部音轨）" else ""
-}
-
-/**
- * 分段并行转码：每个视频单独转成参数一致的片段（exportGate 限 2 路并发，
- * 吃满两路硬件编码器），全部完成后用 mp4parser 在容器层无损拼接成成品。
- */
-private suspend fun transcodeParallelSegments(
-    context: Context,
-    items: List<VideoItem>,
-    infos: List<TrackInfo>,
-    effectFor: (Int) -> Effects?,
-    mixedAudio: Boolean,
-    audioPassthrough: Boolean,
-    outUri: Uri,
-    onProgress: (Int) -> Unit
-): String {
-    val segDir = File(context.getExternalFilesDir(null), uniqueTempName("分段", ""))
-    segDir.mkdirs()
-    try {
-        val progresses = AtomicIntegerArray(items.size)
-        coroutineScope {
-            items.mapIndexed { index, item ->
-                launch(Dispatchers.IO) {
-                    val builder = EditedMediaItem.Builder(MediaItem.fromUri(item.uri))
-                    effectFor(index)?.let { builder.setEffects(it) }
-                    if (mixedAudio) builder.setRemoveAudio(true)
-                    val composition = Composition.Builder(
-                        EditedMediaItemSequence.Builder(listOf(builder.build())).build()
-                    )
-                        .apply { if (audioPassthrough) setTransmuxAudio(true) }
-                        .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL)
-                        .build()
-                    val segFile = File(segDir, "seg_$index.mp4")
-                    exportComposition(
-                        context, composition, segFile,
-                        forceAvc = true, forceAac = !audioPassthrough && !mixedAudio
-                    ) { p ->
-                        progresses.set(index, p)
-                        var sum = 0
-                        for (i in 0 until items.size) sum += progresses.get(i)
-                        onProgress(sum / items.size)
-                    }
-                }
-            }
-        }
-        val segFiles = items.indices.map { File(segDir, "seg_$it.mp4") }
-        // 片段在容器层无损拼接成成品（纯 IO，无二次转封装开销）
-        context.contentResolver.openFileDescriptor(outUri, "rw")!!.use { outPfd ->
-            concatMp4Files(segFiles, outPfd)
-        }
-    } finally {
-        segDir.deleteRecursively()
-    }
-    return if (mixedAudio) "（注：组内部分视频没有声音，成品已去掉全部音轨）" else ""
-}
 
 /** 在 MediaStore 创建输出条目（相册 Movies/VideoStitcher），自动避免重名覆盖 */
 fun createOutputUri(context: Context, desiredName: String): Uri {
