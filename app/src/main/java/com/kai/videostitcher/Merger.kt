@@ -5,6 +5,7 @@ import android.content.Context
 import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -158,6 +159,66 @@ fun failureDetail(t: Throwable, infos: List<TrackInfo>): String {
  * 转码直接失败中止，由错误提示引导用户自行转码成普通 MP4 后再导入。
  * （1.2 曾内置 MediaExtractor→MediaMuxer 自动修复重封装，1.3 应用户要求回退。）
  */
+
+/**
+ * 成品自检：引擎"导出成功"不等于文件能播。真机上各片段由相互独立的硬件
+ * 编码会话产出，容器层拼接只保留第一段的解码配置，段间参数集（SPS/PPS/
+ * 色彩信息）不一致时整条流会解不动——模拟器软编码器输出一致，掩盖了这类
+ * 问题。这里做三道检查：时长接近素材总和、首/中/尾三点能解出画面、
+ * 小文件再全量过一遍采样表。返回 null 表示通过，否则返回失败原因。
+ */
+fun verifyOutputUsable(context: Context, uri: Uri, expectedDurationMs: Long): String? {
+    try {
+        val mmr = MediaMetadataRetriever()
+        try {
+            mmr.setDataSource(context, uri)
+            val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: return "读不到成品时长"
+            if (expectedDurationMs > 0 && durMs < expectedDurationMs * 85 / 100)
+                return "成品时长 ${durMs}ms 明显短于素材总时长 ${expectedDurationMs}ms（内容被截断）"
+            val hasVideo =
+                mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes"
+            if (hasVideo) {
+                for (percent in intArrayOf(10, 50, 90)) {
+                    val tUs = durMs * 1000L * percent / 100
+                    val opts = if (percent == 10) MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                    else MediaMetadataRetriever.OPTION_CLOSEST
+                    if (mmr.getFrameAtTime(tUs, opts) == null) return "在 ${percent}% 处解不出画面"
+                }
+            }
+        } finally {
+            mmr.release()
+        }
+    } catch (t: Throwable) {
+        return "自检异常：${t.message ?: t.javaClass.simpleName}"
+    }
+    // 采样表全量扫描只对小块文件做（纯 IO 不解码）：超大文件代价高，
+    // 且截尾/时长异常已被上面两道检查覆盖
+    val sizeBytes = runCatching {
+        context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
+    }.getOrDefault(0L)
+    if (sizeBytes in 1 until 200L * 1024 * 1024) {
+        try {
+            val ex = MediaExtractor()
+            try {
+                ex.setDataSource(context, uri, null)
+                val buf = ByteBuffer.allocateDirect(8 * 1024 * 1024)
+                for (i in 0 until ex.trackCount) ex.selectTrack(i)
+                var count = 0
+                while (ex.readSampleData(buf, 0) >= 0) {
+                    count++
+                    if (!ex.advance()) break
+                }
+                if (count == 0) return "采样表里没有可读数据"
+            } finally {
+                ex.release()
+            }
+        } catch (t: Throwable) {
+            return "采样表读取失败：${t.message ?: t.javaClass.simpleName}"
+        }
+    }
+    return null
+}
 
 /** 用 MediaExtractor 读取视频的编码/分辨率/帧率/音频参数 */
 fun probeVideo(context: Context, uri: Uri): TrackInfo {
@@ -451,6 +512,11 @@ suspend fun transcodeConcat(
     val rotationsUniform = infos.all { it.rotation == first.rotation }
     // 分段拼接要求每个片段编码后尺寸完全一致（mp4parser 同一条轨不允许不同宽高）
     val dimsUniform = infos.all { it.width > 0 && it.width == first.width && it.height == first.height }
+    // 编码也必须一致：分段是相互独立的编码会话，mp4parser 拼接只保留第一段的
+    // 解码配置；真机硬件编码器下 H.265 与 H.264 段的参数集（SPS/PPS/色彩信息）
+    // 常有差异，拼出来会解不动（模拟器软编码输出一致，测不出来）。编码不同的
+    // 组一律走单路连续导出，整条输出只有一个参数集，天生安全。
+    val codecsUniform = infos.all { it.videoMime == first.videoMime }
 
     // 画布策略：组内显示尺寸或旋转不一致时，所有视频统一等比缩放进同一画布
     //（LAYOUT_SCALE_TO_FIT 保持比例、黑边补齐）。带旋转元数据的视频先显式反向旋转，
@@ -483,20 +549,38 @@ suspend fun transcodeConcat(
         }
     }
 
-    // 尺寸/旋转一致时按视频逐个"分段并行转码"（2 路硬件编码器同时跑）再无损拼接，
-    // 提速约一半；混合尺寸/旋转组走整组单路导出（统一画布）。音频参数不一致
+    // 尺寸/旋转/编码一致时按视频逐个"分段并行转码"（2 路硬件编码器同时跑）再无损拼接，
+    // 提速约一半；任一条件不满足（含混合编码）走整组单路导出（统一画布）。音频参数不一致
     //（如 MP3 混 AAC）时片段音轨无法无损相接，同样回退整组单路。
-    if (items.size >= 2 && dimsUniform && rotationsUniform && (mixedAudio || audioUniform)) {
+    // 分段成品必须过自检：真机同编码也可能因色彩信息不同产出坏文件，
+    // 自检不过自动降级单路重拼，宁可慢不可坏。
+    val expectedDurationMs = items.sumOf { it.durationMs }
+    if (items.size >= 2 && dimsUniform && rotationsUniform && codecsUniform && (mixedAudio || audioUniform)) {
         try {
             android.util.Log.i("VideoStitcher", "分段并行转码 ${items.size} 段")
-            return transcodeParallelSegments(
+            val note = transcodeParallelSegments(
                 context, items, infos, effectFor, mixedAudio, audioPassthrough, outUri, onProgress
             )
+            verifyOutputUsable(context, outUri, expectedDurationMs)?.let {
+                android.util.Log.e("VideoStitcher", "分段成品自检未通过（$it），降级单路转码")
+                throw IllegalStateException(it)
+            }
+            return note
         } catch (t: Throwable) {
-            android.util.Log.e("VideoStitcher", "分段并行转码失败，回退单路转码", t)
+            android.util.Log.e("VideoStitcher", "分段并行转码不可用，回退单路转码", t)
         }
     }
-    return transcodeSingle(context, items, infos, effectFor, mixedAudio, audioPassthrough, outUri, onProgress)
+    val note = transcodeSingle(
+        context, items, infos, effectFor, mixedAudio, audioPassthrough, outUri, onProgress, expectedDurationMs
+    )
+    verifyOutputUsable(context, outUri, expectedDurationMs)?.let { reason ->
+        runCatching { context.contentResolver.delete(outUri, null, null) }
+        throw IllegalStateException(
+            "成品自检未通过（$reason）。这个分组在本机拼不出可播放的文件，" +
+                "请把组内视频自行转码成普通 MP4 后重新导入"
+        )
+    }
+    return note
 }
 
 /** 单路转码：整组一次 Transformer 导出（effectFor 决定每个视频的缩放效果） */
@@ -508,7 +592,8 @@ private suspend fun transcodeSingle(
     mixedAudio: Boolean,
     audioPassthrough: Boolean,
     outUri: Uri,
-    onProgress: (Int) -> Unit
+    onProgress: (Int) -> Unit,
+    expectedDurationMs: Long
 ): String {
     val tmp = File(context.getExternalFilesDir(null), uniqueTempName("转码临时", ".mp4"))
     try {
@@ -538,6 +623,10 @@ private suspend fun transcodeSingle(
             )
         }
         copyTmpToOut(context, tmp, outUri)
+        // 单路导出是最后的兜底手段，成品必须自检通过；不过就中止而不是交付坏文件
+        verifyOutputUsable(context, outUri, expectedDurationMs)?.let { reason ->
+            throw IllegalStateException("转码成品自检未通过：$reason")
+        }
     } finally {
         tmp.delete()
     }

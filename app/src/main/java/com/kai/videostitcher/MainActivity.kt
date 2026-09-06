@@ -360,6 +360,7 @@ class MainActivity : AppCompatActivity() {
         }
         val first = infos.first()
         val paramsUniform = infos.all { it.matches(first) }
+        val expectedDurationMs = group.items.sumOf { it.durationMs }
         val mp4Family = group.items.all { isLosslessCapableName(it.name) }
         // mp4parser 解析不了 AV1 的 av01 采样条目（实测抛异常），无损路径必须排除 AV1
         val hasAv1 = infos.any { it.videoMime == "video/av01" }
@@ -370,6 +371,10 @@ class MainActivity : AppCompatActivity() {
             try {
                 contentResolver.openFileDescriptor(outUri, "rw")!!.use { pfd ->
                     concatLossless(this@MainActivity, group.items, pfd)
+                }
+                // 成品必须自检通过：拼接"成功"不等于能播放，不过就降级下一档
+                verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs)?.let { reason ->
+                    throw IllegalStateException("自检未通过：$reason")
                 }
                 setGroupState(group, "✓ 完成（无损拼接，画质无损失）", 100)
                 return outUri
@@ -387,6 +392,9 @@ class MainActivity : AppCompatActivity() {
             try {
                 transmuxConcat(this@MainActivity, group.items, outUri) { p ->
                     setGroupState(group, "无损转封装中 $p%…", p)
+                }
+                verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs)?.let { reason ->
+                    throw IllegalStateException("自检未通过：$reason")
                 }
                 setGroupState(group, "✓ 完成（无损转封装，无重编码）", 100)
                 return outUri
