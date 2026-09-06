@@ -16,6 +16,8 @@ A minimal Android app that stitches multiple groups of videos into one MP4 each 
 - **编码格式显示**：每个视频下方直接显示 `H.265 1920×1080 · AAC`、`AV1 1072×1920 · Opus` 等
 - 自然排序（`01、02、…、10`）、拖动排序（↑↓ 正确交换不覆盖）、分组自动保存、成品输出到 `相册/Movies/VideoStitcher/`
 
+> 后续计划：恢复"混合参数也能拼"能力的规划见 [ROADMAP.md](ROADMAP.md)（路线 A：自研受控硬件转码管线）。
+
 ## 截图
 
 ![应用截图](screenshot.png)
