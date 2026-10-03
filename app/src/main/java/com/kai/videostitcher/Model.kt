@@ -35,6 +35,15 @@ object Thumbs {
     @Synchronized
     fun load(context: Context, uri: Uri): Bitmap? {
         cache.get(uri.toString())?.let { return it }
+        // API 29+ 优先取系统缩略图缓存：系统已生成过的直接命中，毫秒级返回
+        if (Build.VERSION.SDK_INT >= 29) {
+            runCatching {
+                context.contentResolver.loadThumbnail(uri, android.util.Size(MAX_DIM, MAX_DIM), null)
+            }.getOrNull()?.let { thumb ->
+                cache.put(uri.toString(), thumb)
+                return thumb
+            }
+        }
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(context, uri)

@@ -27,6 +27,9 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -334,6 +337,10 @@ class MainActivity : AppCompatActivity() {
                     try {
                         val out = mergeGroup(group)
                         outputs.add(out)
+                    } catch (c: CancellationException) {
+                        // 取消不是失败：向上传播让 lifecycleScope 正常收尾，
+                        // 别把取消误标成"✗ 失败"
+                        throw c
                     } catch (t: Throwable) {
                         setGroupState(group, "✗ 失败：${t.message ?: t.javaClass.simpleName}", -1)
                     } finally {
@@ -369,31 +376,29 @@ class MainActivity : AppCompatActivity() {
         }
         checkDiskSpace(group)
         setGroupState(group, "分析视频参数…", null)
-        val infos = group.items.map {
-            runCatching { probeVideo(this@MainActivity, it.uri) }.getOrElse { t ->
-                android.util.Log.e(TAG, "probe failed: ${it.uri}", t)
-                TrackInfo(null, 0, 0, 0, 0f, null, 0, 0, false)
-            }
+        // 逐项并行探测：几十条的分组串行要探几十秒，并行只花最长那一条的时间
+        val infos = coroutineScope {
+            group.items.map { item ->
+                async(Dispatchers.IO) {
+                    runCatching { probeVideo(this@MainActivity, item.uri) }.getOrElse { t ->
+                        android.util.Log.e(TAG, "probe failed: ${item.uri}", t)
+                        TrackInfo(null, 0, 0, 0, 0f, null, 0, 0, false)
+                    }
+                }
+            }.awaitAll()
         }
         val first = infos.first()
         val paramsUniform = infos.all { it.matches(first) }
-        var expectedDurationMs = group.items.sumOf { it.durationMs }
-        if (expectedDurationMs <= 0) {
-            // 导入时的时长探测可能失败过（存了 0）：拼前补探，给自检一个时长基准，
-            // 否则成品截断检查会被静默跳过
-            expectedDurationMs = group.items.sumOf { item ->
-                if (item.durationMs > 0) item.durationMs else probeDuration(this@MainActivity, item.uri)
-            }
+        // 导入时的时长探测可能失败过（存了 0）：拼前逐项补探——只补缺失项，
+        // 否则总时长被低估、自检的截断阈值会被放松
+        group.items.forEach { item ->
+            if (item.durationMs <= 0) item.durationMs = probeDuration(this@MainActivity, item.uri)
         }
+        val expectedDurationMs = group.items.sumOf { it.durationMs }
         val mp4Family = group.items.all { isLosslessCapableName(it.name) }
         // mp4parser 解析不了 AV1 的 av01 采样条目（实测抛异常），无损路径必须排除 AV1
         val hasAv1 = infos.any { it.videoMime == "video/av01" }
         val probeFailed = infos.count { it.videoMime == null }
-        // 预判是否会落到转码级：转码的分段中间文件都写在 cacheDir（内置 data 分区），
-        // 与成品所在的共享存储是两个分区，可用空间常差好几倍，要分开查
-        val willTranscode = !(paramsUniform && mp4Family && !hasAv1) &&
-            !(paramsUniform && isMp4MuxCompatible(infos) && infos.all { it.rotation == 0 })
-        if (willTranscode) checkInternalDiskSpace(group)
         return runMergeEngines(group, infos, expectedDurationMs, paramsUniform, mp4Family, hasAv1, probeFailed)
     }
 
@@ -420,9 +425,8 @@ class MainActivity : AppCompatActivity() {
                         concatLossless(this@MainActivity, group.items, pfd)
                     }
                     // 成品必须自检通过：拼接"成功"不等于能播放，不过就降级下一档
-                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs)?.let { reason ->
-                        throw IllegalStateException("自检未通过：$reason")
-                    }
+                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs, segmentCheckPoints(group.items))
+                        ?.let { reason -> throw IllegalStateException("自检未通过：$reason") }
                     setGroupState(group, "✓ 完成（无损拼接，画质无损失）", 100)
                     return outUri
                 } catch (c: CancellationException) {
@@ -445,16 +449,35 @@ class MainActivity : AppCompatActivity() {
                     transmuxConcat(this@MainActivity, group.items, outUri) { p ->
                         setGroupState(group, "无损转封装中 $p%…", p)
                     }
-                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs)?.let { reason ->
-                        throw IllegalStateException("自检未通过：$reason")
-                    }
+                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs, segmentCheckPoints(group.items))
+                        ?.let { reason -> throw IllegalStateException("自检未通过：$reason") }
                     setGroupState(group, "✓ 完成（无损转封装，无重编码）", 100)
                     return outUri
                 } catch (c: CancellationException) {
                     throw c
                 } catch (t: Throwable) {
                     android.util.Log.e(TAG, "transmux failed", t)
-                    setGroupState(group, "转封装失败（${t.message ?: "格式不兼容"}），尝试转码…", null)
+                    setGroupState(group, "转封装失败（${t.message ?: "格式不兼容"}），尝试其它无损方式…", null)
+                }
+            }
+            // 第二级半（1.5.4 新增）：视频参数完全一致（含 csd 解码配置字节逐字节一致）
+            // 但音频不一致的组——视频流一个字节不动、只重编音频（秒级）。录屏混相机、
+            // 44.1k 混 48k 这类常见组从分钟级转码降到秒级，且视频零画质损失
+            if (mp4Family && probeFailed == 0 &&
+                infos.all { it.csd != null && it.matchesVideoOnly(infos.first()) }
+            ) {
+                setGroupState(group, "视频无损拼接中（仅音频重编，秒级）…", null)
+                try {
+                    videoCopyConcatAudio(this@MainActivity, group.items, infos, outUri) { msg ->
+                        setGroupState(group, msg, null)
+                    }
+                    setGroupState(group, "✓ 完成（视频无损 + 音频重编，画质无损失）", 100)
+                    return outUri
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    android.util.Log.e(TAG, "video-copy concat failed", t)
+                    setGroupState(group, "视频无损+音频重编失败（${t.message ?: "格式不兼容"}），尝试转码…", null)
                 }
             }
             // 第三级（v1.5 新增）：参数不一致或前两级处理不了 → ffmpeg 逐段独立转码成
@@ -468,6 +491,9 @@ class MainActivity : AppCompatActivity() {
                             "请把它们自行转码成参数一致的普通 MP4 后再导入"
                     )
                 }
+                // 真正落到转码级才检查内置分区（转码分段中间文件都在 cacheDir）：
+                // 运行期从无损降级下来的组也躲不过这一关
+                checkInternalDiskSpace(group)
                 setGroupState(group, "自动转码拼接中…（较慢，约为视频时长）", null)
                 try {
                     transcodeConcat(this@MainActivity, group.items, infos, outUri) { msg ->
@@ -497,9 +523,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 磁盘空间预检（成品输出卷）：无论无损还是转码，成品都是整文件写到
-     * MediaStore（共享存储）；大分组峰值需要约素材 1.3 倍空间。不足时开工前
-     * 就报清楚，而不是半路 IOException 被误归成"格式不兼容"。
+     * 磁盘空间预检（成品输出卷）：成品整文件写出，转封装还要先写临时件再整块
+     * 拷贝（峰值约 2×）；素材体积只是下限参考（crf 转码输出可能比源更大）。
+     * 不足时开工前就报清楚，而不是半路 IOException 被误归成"格式不兼容"。
      */
     private fun checkDiskSpace(group: Group) {
         val dir = getExternalFilesDir(null) ?: Environment.getExternalStorageDirectory() ?: return
@@ -510,7 +536,7 @@ class MainActivity : AppCompatActivity() {
                 contentResolver.openFileDescriptor(item.uri, "r")?.use { needBytes += it.statSize }
             }
         }
-        needBytes = needBytes * 13 / 10 + 200L * 1024 * 1024
+        needBytes = needBytes * 2 + 200L * 1024 * 1024
         if (available < needBytes) {
             throw IllegalStateException(
                 "存储空间不足：本组约需 ${needBytes / (1024 * 1024)}MB，设备可用 ${available / (1024 * 1024)}MB，请清理空间后重试"
@@ -519,8 +545,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 转码分区的预检：转码的分段中间文件与拼接临时件都写在 cacheDir（内置
-     * data 分区），和共享存储不是一个卷，可用空间常差好几倍，必须单独查。
+     * 转码分区的预检：分段中间件（合计约等于成品大小）+ 拼接临时件（再一份）+
+     * 重编放大的余量，峰值约素材的 2.6 倍；写在 cacheDir（内置 data 分区），
+     * 和共享存储不是一个卷，可用空间常差好几倍，必须单独查。
      */
     private fun checkInternalDiskSpace(group: Group) {
         val available = runCatching { StatFs(cacheDir.path).availableBytes }.getOrDefault(Long.MAX_VALUE)
@@ -530,7 +557,7 @@ class MainActivity : AppCompatActivity() {
                 contentResolver.openFileDescriptor(item.uri, "r")?.use { needBytes += it.statSize }
             }
         }
-        needBytes = needBytes * 13 / 10 + 200L * 1024 * 1024
+        needBytes = needBytes * 26 / 10 + 200L * 1024 * 1024
         if (available < needBytes) {
             throw IllegalStateException(
                 "存储空间不足（应用数据分区）：本组转码约需 ${needBytes / (1024 * 1024)}MB，" +
