@@ -110,7 +110,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
-            android:text="🎬 查看成品（已保存到 相册 Movies/VideoStitcher）"
+            android:text="📁 打开相册（成品已保存到 Movies/VideoStitcher）"
             android:visibility="gone" />
     </LinearLayout>
 </LinearLayout>

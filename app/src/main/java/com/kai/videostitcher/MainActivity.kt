@@ -19,7 +19,9 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
@@ -35,6 +37,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import android.app.RecoverableSecurityException
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 
 class MainActivity : AppCompatActivity() {
 
@@ -52,7 +57,29 @@ class MainActivity : AppCompatActivity() {
     private val groups = mutableListOf<Group>()
     private val cardViews = HashMap<Group, CardViews>()
     private val outputs: MutableList<Uri> = Collections.synchronizedList(mutableListOf())
+    private val mergedGroups = mutableListOf<Group>()
     private var merging = false
+
+    // ---- 删除源视频（拼接成功后可选）----
+    private var deleteGroups: List<Group> = emptyList()
+    private val deleteQueue = ArrayDeque<Uri>()
+    private var deleteOk = 0
+    private var deleteFail = 0
+    private var deleteBatchCount = 0
+
+    private val batchDeleteLauncher =
+        registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { res ->
+            // API 30+ 的一次系统确认覆盖整批媒体条目（进相册回收站，可恢复）
+            if (res.resultCode == RESULT_OK) deleteOk += deleteBatchCount else deleteFail += deleteBatchCount
+            finishDeletion()
+        }
+    private val fileDeleteLauncher =
+        registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { res ->
+            // API 29 的逐条授权流程
+            if (res.resultCode == RESULT_OK) deleteOk++ else deleteFail++
+            deleteQueue.removeFirstOrNull()
+            processDeleteQueue()
+        }
 
     private lateinit var containerGroups: LinearLayout
     private lateinit var tvEmpty: TextView
@@ -327,6 +354,7 @@ class MainActivity : AppCompatActivity() {
         pbOverall.isVisible = true
         btnOpenOutput.isVisible = false
         outputs.clear()
+        mergedGroups.clear()
         val targets = groups.filter { it.items.isNotEmpty() }
         // 各组并行推进；Transformer 导出类工作由 Merger.exportGate 全局限 2 路，
         // 无损拼接只吃 IO 可完全并行
@@ -337,6 +365,7 @@ class MainActivity : AppCompatActivity() {
                     try {
                         val out = mergeGroup(group)
                         outputs.add(out)
+                        mergedGroups.add(group)
                     } catch (c: CancellationException) {
                         // 取消不是失败：向上传播让 lifecycleScope 正常收尾，
                         // 别把取消误标成"✗ 失败"
@@ -361,8 +390,87 @@ class MainActivity : AppCompatActivity() {
                 else
                     "完成 $ok/${targets.size}，失败的分组下方有提示。"
                 if (ok > 0) btnOpenOutput.isVisible = true
+                // 拼接成功后询问是否删除源视频（只针对成功组，破坏性操作必须显式确认）
+                if (mergedGroups.isNotEmpty()) confirmDeleteSources(mergedGroups.toList())
             }
         }
+    }
+
+    private fun confirmDeleteSources(groupsDone: List<Group>) {
+        val count = groupsDone.sumOf { it.items.size }
+        AlertDialog.Builder(this)
+            .setTitle("删除源视频")
+            .setMessage(
+                "已成功拼接 ${groupsDone.size} 组（共 $count 个源视频）。\n\n" +
+                    "删除这些源视频并移除对应分组？\n删除走系统确认流程，Android 11+ 会移入相册回收站，30 天内可恢复。"
+            )
+            .setPositiveButton("删除源视频") { _, _ -> startDeletion(groupsDone) }
+            .setNegativeButton("保留", null)
+            .show()
+    }
+
+    private fun startDeletion(groupsDone: List<Group>) {
+        deleteGroups = groupsDone
+        deleteOk = 0
+        deleteFail = 0
+        val uris = groupsDone.flatMap { g -> g.items.map { it.uri } }.distinct()
+        // 文件夹导入/文件选择器进来的是 SAF 文档，持有目录授权即可直接删；
+        // 相册媒体条目属于相机/微信等其它应用，必须走系统删除确认
+        val docs = uris.filter { it.authority != "media" }
+        val media = uris.filter { it.authority == "media" }
+        for (u in docs) {
+            val ok = runCatching { DocumentsContract.deleteDocument(contentResolver, u) }.getOrDefault(false)
+            if (ok) deleteOk++ else deleteFail++
+        }
+        when {
+            media.isEmpty() -> finishDeletion()
+            Build.VERSION.SDK_INT >= 30 -> {
+                deleteBatchCount = media.size
+                val pi = MediaStore.createDeleteRequest(contentResolver, media)
+                batchDeleteLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
+            }
+            else -> {
+                deleteQueue.addAll(media)
+                processDeleteQueue()
+            }
+        }
+    }
+
+    private fun processDeleteQueue() {
+        while (deleteQueue.isNotEmpty()) {
+            val u = deleteQueue.first()
+            val res = runCatching { contentResolver.delete(u, null, null) }
+            if (res.getOrDefault(0) > 0) {
+                deleteOk++
+                deleteQueue.removeFirstOrNull()
+                continue
+            }
+            val ex = res.exceptionOrNull()
+            // API 29 上删除非本应用创建的媒体需要逐条系统授权
+            if (Build.VERSION.SDK_INT == 29 && ex is RecoverableSecurityException) {
+                fileDeleteLauncher.launch(
+                    IntentSenderRequest.Builder(ex.userAction.actionIntent.intentSender).build()
+                )
+                return
+            }
+            deleteFail++
+            deleteQueue.removeFirstOrNull()
+        }
+        finishDeletion()
+    }
+
+    private fun finishDeletion() {
+        if (deleteOk + deleteFail == 0) return
+        if (deleteFail == 0) {
+            // 全部删除成功才移除分组：部分失败时保留分组，用户还找得到没删掉的源
+            groups.removeAll(deleteGroups.toSet())
+            mergedGroups.clear()
+            render()
+        }
+        toast(
+            "已删除 $deleteOk 个源视频" +
+                if (deleteFail > 0) "，$deleteFail 个未能删除，分组已保留" else "，对应分组已移除"
+        )
     }
 
     private suspend fun mergeGroup(group: Group): Uri {
@@ -598,12 +706,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun openLastOutput() {
         val uri = outputs.lastOrNull() ?: return
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "video/mp4")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        // 优先跳系统相册的视频列表：成品按时间排在最前，能看到拼接结果与上下文，
+        // 也方便紧接着决定是否删除源视频
+        val gallery = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video/*")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        runCatching { startActivity(gallery) }.onFailure {
+            // 没有应用处理视频目录视图时，退回直接打开最新成品
+            val single = Intent(Intent.ACTION_VIEW)
+                .setDataAndType(uri, "video/mp4")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            runCatching { startActivity(single) }
+                .onFailure { toast("成品保存在 相册 → Movies/VideoStitcher") }
         }
-        runCatching { startActivity(intent) }
-            .onFailure { toast("成品保存在 相册 → Movies/VideoStitcher") }
     }
 
     private fun toast(msg: String) {
