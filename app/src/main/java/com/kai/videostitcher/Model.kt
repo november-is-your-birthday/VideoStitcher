@@ -12,7 +12,10 @@ import org.json.JSONObject
 
 data class VideoItem(val uri: Uri, val name: String, var durationMs: Long, var codec: String = "")
 
-class Group(var name: String, val items: MutableList<VideoItem> = mutableListOf())
+class Group(var name: String, val items: MutableList<VideoItem> = mutableListOf()) {
+    /** 最近一次拼接是否成功：控制卡片上"删除原视频"按钮灰/红 */
+    var mergedOk: Boolean = false
+}
 
 /** 视频封面缩略图的内存缓存与加载 */
 object Thumbs {
@@ -82,6 +85,7 @@ object Store {
         for (g in groups) {
             val gi = JSONObject()
             gi.put("name", g.name)
+            if (g.mergedOk) gi.put("merged", true)
             val items = JSONArray()
             for (item in g.items) {
                 val o = JSONObject()
@@ -107,6 +111,7 @@ object Store {
             for (i in 0 until arr.length()) {
                 val gi = arr.getJSONObject(i)
                 val g = Group(gi.getString("name"))
+                g.mergedOk = gi.optBoolean("merged")
                 val items = gi.getJSONArray("items")
                 for (j in 0 until items.length()) {
                     val o = items.getJSONObject(j)

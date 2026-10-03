@@ -1,8 +1,10 @@
 package com.kai.videostitcher
 
 import android.Manifest
+import android.content.ContentUris
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -22,7 +24,6 @@ import android.widget.Toast
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
@@ -36,6 +37,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import android.app.RecoverableSecurityException
@@ -46,19 +48,22 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "VideoStitcher"
+        // "删除原视频"按钮：拼接成功前灰、成功后红
+        private val COLOR_DELETE_OFF = Color.parseColor("#9E9E9E")
+        private val COLOR_DELETE_ON = Color.parseColor("#D32F2F")
     }
 
     private class CardViews(
         val progressBar: ProgressBar,
         val statusText: TextView,
         val infoText: TextView,
-        val fileDurationViews: List<TextView>
+        val fileDurationViews: List<TextView>,
+        val btnDeleteSources: Button
     )
 
     private val groups = mutableListOf<Group>()
     private val cardViews = HashMap<Group, CardViews>()
     private val outputs: MutableList<Uri> = Collections.synchronizedList(mutableListOf())
-    private val mergedGroups = mutableListOf<Group>()
     private var merging = false
 
     // ---- 删除源视频（拼接成功后可选）----
@@ -309,6 +314,7 @@ class MainActivity : AppCompatActivity() {
         val llFiles = card.findViewById<LinearLayout>(R.id.llFiles)
         val pbGroup = card.findViewById<ProgressBar>(R.id.pbGroup)
         val tvStatusGroup = card.findViewById<TextView>(R.id.tvGroupStatus)
+        val btnDeleteSources = card.findViewById<Button>(R.id.btnDeleteSources)
 
         etName.setText(group.name)
         etName.addTextChangedListener(object : TextWatcher {
@@ -322,6 +328,18 @@ class MainActivity : AppCompatActivity() {
             if (merging) return@setOnClickListener
             groups.remove(group)
             render()
+        }
+
+        // 删除原视频：只在该组最近一次拼接成功后可点（红色），否则灰色
+        fun refreshDeleteSources() {
+            val active = group.mergedOk && !merging
+            btnDeleteSources.isEnabled = active
+            btnDeleteSources.setTextColor(if (active) COLOR_DELETE_ON else COLOR_DELETE_OFF)
+        }
+        refreshDeleteSources()
+        btnDeleteSources.setOnClickListener {
+            if (merging || !group.mergedOk) return@setOnClickListener
+            startDeletion(listOf(group))
         }
 
         fun refreshInfo() {
@@ -350,16 +368,20 @@ class MainActivity : AppCompatActivity() {
             up.setOnClickListener {
                 if (merging) return@setOnClickListener
                 Collections.swap(group.items, index, index - 1)
+                // 内容变了，已拼接状态失效：按钮退回灰色
+                group.mergedOk = false
                 render()
             }
             down.setOnClickListener {
                 if (merging) return@setOnClickListener
                 Collections.swap(group.items, index, index + 1)
+                group.mergedOk = false
                 render()
             }
             row.findViewById<Button>(R.id.btnRemove).setOnClickListener {
                 if (merging) return@setOnClickListener
                 group.items.removeAt(index)
+                group.mergedOk = false
                 if (group.items.isEmpty()) groups.remove(group)
                 render()
             }
@@ -379,7 +401,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        cardViews[group] = CardViews(pbGroup, tvStatusGroup, tvInfo, fileDurationViews)
+        cardViews[group] = CardViews(pbGroup, tvStatusGroup, tvInfo, fileDurationViews, btnDeleteSources)
         return card
     }
 
@@ -405,8 +427,8 @@ class MainActivity : AppCompatActivity() {
         pbOverall.isVisible = true
         btnOpenOutput.isVisible = false
         outputs.clear()
-        mergedGroups.clear()
         val targets = groups.filter { it.items.isNotEmpty() }
+        val succeeded = Collections.synchronizedList(mutableListOf<Group>())
         // 各组并行推进；Transformer 导出类工作由 Merger.exportGate 全局限 2 路，
         // 无损拼接只吃 IO 可完全并行
         val done = AtomicInteger(0)
@@ -416,7 +438,7 @@ class MainActivity : AppCompatActivity() {
                     try {
                         val out = mergeGroup(group)
                         outputs.add(out)
-                        mergedGroups.add(group)
+                        succeeded.add(group)
                     } catch (c: CancellationException) {
                         // 取消不是失败：向上传播让 lifecycleScope 正常收尾，
                         // 别把取消误标成"✗ 失败"
@@ -441,23 +463,37 @@ class MainActivity : AppCompatActivity() {
                 else
                     "完成 $ok/${targets.size}，失败的分组下方有提示。"
                 if (ok > 0) btnOpenOutput.isVisible = true
-                // 拼接成功后询问是否删除源视频（只针对成功组，破坏性操作必须显式确认）
-                if (mergedGroups.isNotEmpty()) confirmDeleteSources(mergedGroups.toList())
+                // 只有确认成功的组才点亮红色"删除原视频"，失败的组保持灰色。
+                // 立即落盘：进程被杀（崩溃/低内存）也不会把成功状态丢掉
+                succeeded.forEach { it.mergedOk = true }
+                Store.save(this@MainActivity, groups)
+                groups.forEach { g ->
+                    cardViews[g]?.let { cv ->
+                        val active = g.mergedOk && !merging
+                        cv.btnDeleteSources.isEnabled = active
+                        cv.btnDeleteSources.setTextColor(
+                            if (active) COLOR_DELETE_ON else COLOR_DELETE_OFF
+                        )
+                    }
+                }
             }
         }
     }
 
-    private fun confirmDeleteSources(groupsDone: List<Group>) {
-        val count = groupsDone.sumOf { it.items.size }
-        AlertDialog.Builder(this)
-            .setTitle("删除源视频")
-            .setMessage(
-                "已成功拼接 ${groupsDone.size} 组（共 $count 个源视频）。\n\n" +
-                    "删除这些源视频并移除对应分组？\n删除走系统确认流程，Android 11+ 会移入相册回收站，30 天内可恢复。"
-            )
-            .setPositiveButton("删除源视频") { _, _ -> startDeletion(groupsDone) }
-            .setNegativeButton("保留", null)
-            .show()
+    /**
+     * 照片选择器返回 content://media/picker/…/media/<id> 形态的 URI（读取没问题），
+     * 但 createDeleteRequest 只认带具体 ID 的媒体条目 URI——把 picker URI 还原成
+     * 条目 URI；普通相册 URI 原样返回。
+     */
+    private fun mediaItemUri(u: Uri): Uri {
+        val segs = u.pathSegments
+        if (segs.size > 2 && segs[0] == "picker") {
+            val id = segs.last().toLongOrNull()
+            if (id != null) {
+                return ContentUris.withAppendedId(MediaStore.Video.Media.getContentUri("external"), id)
+            }
+        }
+        return u
     }
 
     private fun startDeletion(groupsDone: List<Group>) {
@@ -468,7 +504,7 @@ class MainActivity : AppCompatActivity() {
         // 文件夹导入/文件选择器进来的是 SAF 文档，持有目录授权即可直接删；
         // 相册媒体条目属于相机/微信等其它应用，必须走系统删除确认
         val docs = uris.filter { it.authority != "media" }
-        val media = uris.filter { it.authority == "media" }
+        val media = uris.filter { it.authority == "media" }.map { mediaItemUri(it) }
         for (u in docs) {
             val ok = runCatching { DocumentsContract.deleteDocument(contentResolver, u) }.getOrDefault(false)
             if (ok) deleteOk++ else deleteFail++
@@ -476,9 +512,15 @@ class MainActivity : AppCompatActivity() {
         when {
             media.isEmpty() -> finishDeletion()
             Build.VERSION.SDK_INT >= 30 -> {
-                deleteBatchCount = media.size
-                val pi = MediaStore.createDeleteRequest(contentResolver, media)
-                batchDeleteLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
+                // URI 形态异常等极端情况：宁可放弃删除也别崩（分组保留，源视频无损）
+                val pi = runCatching { MediaStore.createDeleteRequest(contentResolver, media) }.getOrNull()
+                if (pi == null) {
+                    deleteFail += media.size
+                    finishDeletion()
+                } else {
+                    deleteBatchCount = media.size
+                    batchDeleteLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
+                }
             }
             else -> {
                 deleteQueue.addAll(media)
@@ -515,7 +557,6 @@ class MainActivity : AppCompatActivity() {
         if (deleteFail == 0) {
             // 全部删除成功才移除分组：部分失败时保留分组，用户还找得到没删掉的源
             groups.removeAll(deleteGroups.toSet())
-            mergedGroups.clear()
             render()
         }
         toast(
@@ -536,7 +577,7 @@ class MainActivity : AppCompatActivity() {
         checkDiskSpace(group)
         setGroupState(group, "分析视频参数…", null)
         // 逐项并行探测：几十条的分组串行要探几十秒，并行只花最长那一条的时间
-        val infos = coroutineScope {
+        var infos = coroutineScope {
             group.items.map { item ->
                 async(Dispatchers.IO) {
                     runCatching { probeVideo(this@MainActivity, item.uri) }.getOrElse { t ->
@@ -546,19 +587,53 @@ class MainActivity : AppCompatActivity() {
                 }
             }.awaitAll()
         }
-        val first = infos.first()
-        val paramsUniform = infos.all { it.matches(first) }
-        // 导入时的时长探测可能失败过（存了 0）：拼前逐项补探——只补缺失项，
-        // 否则总时长被低估、自检的截断阈值会被放松
-        group.items.forEach { item ->
-            if (item.durationMs <= 0) item.durationMs = probeDuration(this@MainActivity, item.uri)
+        // 带外来轨的输入（Android 13+ 录屏的 mett 元数据轨、字幕/时间码轨）所有引擎
+        // 都读不了：先 -c copy 无损剥离再进引擎链；个别剥离失败的原样保留不更糟
+        var workItems = group.items
+        val cleanedFiles = mutableListOf<File>()
+        try {
+            if (infos.any { it.extraTracks > 0 }) {
+                setGroupState(group, "清理附加数据轨…", null)
+                val work = mutableListOf<VideoItem>()
+                group.items.forEachIndexed { i, item ->
+                    if (infos[i].extraTracks > 0) {
+                        val tmp = File(cacheDir, uniqueTempName("剥轨", ".mp4"))
+                        if (stripForeignTracks(this@MainActivity, item.uri, tmp)) {
+                            cleanedFiles.add(tmp)
+                            work.add(VideoItem(Uri.fromFile(tmp), item.name, item.durationMs))
+                        } else {
+                            runCatching { tmp.delete() }
+                            work.add(item)
+                        }
+                    } else {
+                        work.add(item)
+                    }
+                }
+                if (work != group.items.toList()) {
+                    workItems = work
+                    infos = infos.mapIndexed { i, info ->
+                        if (workItems[i].uri != group.items[i].uri)
+                            runCatching { probeVideo(this@MainActivity, workItems[i].uri) }.getOrElse { info }
+                        else info
+                    }
+                }
+            }
+            val first = infos.first()
+            val paramsUniform = infos.all { it.matches(first) }
+            // 导入时的时长探测可能失败过（存了 0）：拼前逐项补探——只补缺失项，
+            // 否则总时长被低估、自检的截断阈值会被放松
+            workItems.forEach { item ->
+                if (item.durationMs <= 0) item.durationMs = probeDuration(this@MainActivity, item.uri)
+            }
+            val expectedDurationMs = workItems.sumOf { it.durationMs }
+            val mp4Family = workItems.all { isLosslessCapableName(it.name) }
+            // mp4parser 解析不了 AV1 的 av01 采样条目（实测抛异常），无损路径必须排除 AV1
+            val hasAv1 = infos.any { it.videoMime == "video/av01" }
+            val probeFailed = infos.count { it.videoMime == null }
+            return runMergeEngines(group, workItems, infos, expectedDurationMs, paramsUniform, mp4Family, hasAv1, probeFailed)
+        } finally {
+            cleanedFiles.forEach { runCatching { it.delete() } }
         }
-        val expectedDurationMs = group.items.sumOf { it.durationMs }
-        val mp4Family = group.items.all { isLosslessCapableName(it.name) }
-        // mp4parser 解析不了 AV1 的 av01 采样条目（实测抛异常），无损路径必须排除 AV1
-        val hasAv1 = infos.any { it.videoMime == "video/av01" }
-        val probeFailed = infos.count { it.videoMime == null }
-        return runMergeEngines(group, infos, expectedDurationMs, paramsUniform, mp4Family, hasAv1, probeFailed)
     }
 
     /**
@@ -568,6 +643,7 @@ class MainActivity : AppCompatActivity() {
      */
     private suspend fun runMergeEngines(
         group: Group,
+        items: List<VideoItem>,
         infos: List<TrackInfo>,
         expectedDurationMs: Long,
         paramsUniform: Boolean,
@@ -581,10 +657,10 @@ class MainActivity : AppCompatActivity() {
                 setGroupState(group, "无损拼接中…（不重新编码，秒级完成）", null)
                 try {
                     contentResolver.openFileDescriptor(outUri, "rw")!!.use { pfd ->
-                        concatLossless(this@MainActivity, group.items, pfd)
+                        concatLossless(this@MainActivity, items, pfd)
                     }
                     // 成品必须自检通过：拼接"成功"不等于能播放，不过就降级下一档
-                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs, segmentCheckPoints(group.items))
+                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs, segmentCheckPoints(items))
                         ?.let { reason -> throw IllegalStateException("自检未通过：$reason") }
                     setGroupState(group, "✓ 完成（无损拼接，画质无损失）", 100)
                     return outUri
@@ -605,10 +681,10 @@ class MainActivity : AppCompatActivity() {
                 // 参数一致且编码能直封进 MP4（任意容器，含 MKV/WebM/TS/AV1）：
                 // 直接拷贝压缩流换壳，不解码不重编码
                 try {
-                    transmuxConcat(this@MainActivity, group.items, outUri) { p ->
+                    transmuxConcat(this@MainActivity, items, outUri) { p ->
                         setGroupState(group, "无损转封装中 $p%…", p)
                     }
-                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs, segmentCheckPoints(group.items))
+                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs, segmentCheckPoints(items))
                         ?.let { reason -> throw IllegalStateException("自检未通过：$reason") }
                     setGroupState(group, "✓ 完成（无损转封装，无重编码）", 100)
                     return outUri
@@ -627,7 +703,7 @@ class MainActivity : AppCompatActivity() {
             ) {
                 setGroupState(group, "视频无损拼接中（仅音频重编，秒级）…", null)
                 try {
-                    videoCopyConcatAudio(this@MainActivity, group.items, infos, outUri) { msg ->
+                    videoCopyConcatAudio(this@MainActivity, items, infos, outUri) { msg ->
                         setGroupState(group, msg, null)
                     }
                     setGroupState(group, "✓ 完成（视频无损 + 音频重编，画质无损失）", 100)
@@ -655,7 +731,7 @@ class MainActivity : AppCompatActivity() {
                 checkInternalDiskSpace(group)
                 setGroupState(group, "自动转码拼接中…（较慢，约为视频时长）", null)
                 try {
-                    transcodeConcat(this@MainActivity, group.items, infos, outUri) { msg ->
+                    transcodeConcat(this@MainActivity, items, infos, outUri) { msg ->
                         setGroupState(group, msg, null)
                     }
                     setGroupState(group, "✓ 完成（转码拼接，已统一为 H.264+AAC）", 100)

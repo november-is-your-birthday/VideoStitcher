@@ -55,7 +55,7 @@ import java.util.Locale
 private val exportGate = Semaphore(2)
 
 /** 临时文件/目录唯一名：纯毫秒时间戳在多分组并行时会同毫秒撞名，互相删文件 */
-private fun uniqueTempName(prefix: String, suffix: String): String =
+fun uniqueTempName(prefix: String, suffix: String): String =
     "${prefix}_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(8)}$suffix"
 
 data class TrackInfo(
@@ -70,7 +70,9 @@ data class TrackInfo(
     val hasAudio: Boolean,
     val profile: Int = -1,
     val hdr: Boolean = false,
-    val csd: ByteArray? = null
+    val csd: ByteArray? = null,
+    /** 非音视频轨数量：Android 13+ 录屏的 mett 时间元数据轨、字幕轨等 */
+    val extraTracks: Int = 0
 ) {
     /** 视频流参数是否一致（不含音频）：解码配置字节（csd-0 = avcC/hvcC）一致时，
      *  profile/level/VUI 全部涵盖，比逐字段比对比更严也更快 */
@@ -287,9 +289,14 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
         var profile = -1
         var hdr = false
         var csd: ByteArray? = null
+        var extraTracks = 0
         for (i in 0 until extractor.trackCount) {
             val format = extractor.getTrackFormat(i)
-            val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+            val mime = format.getString(MediaFormat.KEY_MIME)
+            if (mime == null) {
+                extraTracks++
+                continue
+            }
             if (mime.startsWith("video/") && videoMime == null) {
                 videoMime = mime
                 var w = if (format.containsKey(MediaFormat.KEY_WIDTH)) format.getInteger(MediaFormat.KEY_WIDTH) else 0
@@ -321,9 +328,11 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
                     if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 0
                 channels =
                     if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 0
+            } else if (!mime.startsWith("video/") && !mime.startsWith("audio/")) {
+                extraTracks++
             }
         }
-        return TrackInfo(videoMime, width, height, rotation, fps, audioMime, sampleRate, channels, audioMime != null, profile, hdr, csd)
+        return TrackInfo(videoMime, width, height, rotation, fps, audioMime, sampleRate, channels, audioMime != null, profile, hdr, csd, extraTracks)
     } finally {
         extractor.release()
     }
@@ -642,6 +651,27 @@ suspend fun videoCopyConcatAudio(
 private fun listsEqual(a: List<ByteArray>, b: List<ByteArray>): Boolean =
     a.size == b.size && a.zip(b).all { (x, y) -> x.contentEquals(y) }
 
+/**
+ * 剥离外来轨（v1.5.7）：Android 13+ 录屏的 MP4 带两条 mett 时间元数据轨，字幕轨/
+ * 时间码轨同类——mp4parser 解析到非媒体采样条目直接断言崩溃，media3 转封装产出
+ * 0 时长成品，ffmpeg 的解码链也会被数据流带崩。-c copy 重封装只留视频+音频，
+ * 不重编码秒级完成；失败按 false 返回，引擎链按老路走（不会更糟）。
+ */
+suspend fun stripForeignTracks(context: Context, uri: Uri, out: File): Boolean {
+    val input = FFmpegKitConfig.getSafParameterForRead(context, uri)
+    return try {
+        runFfmpeg(
+            "-y -i $input -map 0:v -map 0:a? -c copy '${out.absolutePath}'", 0
+        ) {}
+        true
+    } catch (c: CancellationException) {
+        throw c
+    } catch (t: Throwable) {
+        android.util.Log.w("VideoStitcher", "strip foreign tracks failed", t)
+        false
+    }
+}
+
 private suspend fun transcodeSegment(
     context: Context,
     item: VideoItem,
@@ -715,6 +745,11 @@ private suspend fun runFfmpeg(
         val s = finished.await()
         if (!ReturnCode.isSuccess(s.returnCode)) {
             val tail = runCatching { s.allLogsAsString.takeLast(300) }.getOrDefault("")
+            // 完整命令 + 完整日志进 logcat：失败诊断需要首行报错，300 字符尾部只有统计行
+            android.util.Log.e("VideoStitcher", "ffmpeg 失败 cmd: $command")
+            runCatching { s.allLogsAsString }.getOrNull()?.let {
+                android.util.Log.e("VideoStitcher", "ffmpeg 完整日志: ${it.takeLast(4000)}")
+            }
             throw IllegalStateException("ffmpeg 失败（returnCode=${s.returnCode}）$tail")
         }
     } catch (e: CancellationException) {
