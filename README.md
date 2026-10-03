@@ -73,7 +73,7 @@ cd VideoStitcher
 - **语言/UI**：Kotlin + XML View + Material Components，单 Activity，无第三方 UI 库
 - **无损拼接**：[mp4parser (org.mp4parser:muxer)](https://central.sonatype.com/artifact/org.mp4parser/muxer) 容器级追加音视频轨；安卓上需从 assets 注入 box parser 配置（仓库内已处理）
 - **无损转封装**：[Media3 Transformer](https://developer.android.com/media/media3/transformer)（ExoPlayer 家族官方编辑引擎）transmux 模式，仅拷贝流不重编码（其它容器 → MP4）
-- **转码兜底**：[ffmpeg-kit 社区续维护版](https://github.com/ffmpegkit-maintained/ffmpeg-kit)（`dev.ffmpegkit-maintained:ffmpeg-kit-full-gpl`，官方版 2025 年退役后的社区 fork，API 同名），x264 软编逐段独立转码，行为全机型一致
+- **转码兜底**：[ffmpeg-kit 社区续维护版](https://github.com/ffmpegkit-maintained/ffmpeg-kit)（`dev.ffmpegkit-maintained:ffmpeg-kit-full-gpl`，官方版 2025 年退役后的社区 fork，API 同名），x264 软编逐段独立转码，行为全机型一致；解码走手机硬件解码器分担算力（失败自动退软解）
 - **成品自检**：MediaMetadataRetriever 三点抽帧解码 + MediaExtractor 采样表全量检查（小文件），不过自动降级重拼
 - **输出**：MediaStore（无需存储权限，API 29+），旧版本走运行时权限
 - **探测**：MediaExtractor 读取编码/分辨率/旋转/音频参数，条目内直接展示

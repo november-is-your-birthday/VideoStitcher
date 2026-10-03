@@ -431,10 +431,22 @@ suspend fun transmuxConcat(
 fun ffmpegAvailable(): Boolean =
     Build.SUPPORTED_ABIS.any { it == "arm64-v8a" || it == "x86_64" }
 
-/** 转码目标统一为 H.264 High + AAC，固定 GOP；全组输出参数一致是拼前闸门能过的前提 */
+/** 转码目标统一为 H.264 High + AAC，固定 GOP；全组输出参数一致是拼前闸门能过的前提。
+ *  superfast 比 veryfast 快约 1.5 倍；同 CRF 下档位越低压缩效率越差，
+ *  crf 19 补偿观感（与 veryfast/crf20 基本持平），代价是文件略大（约三成） */
 private const val TRANSCODE_VIDEO =
-    "-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -profile:v high -g 60"
+    "-c:v libx264 -preset superfast -crf 19 -pix_fmt yuv420p -profile:v high -g 60"
 private const val TRANSCODE_AUDIO = "-c:a aac -ar 48000 -ac 2 -b:a 192k"
+
+/** 源编码 → MediaCodec 硬解码器（fork 只带硬解不带硬编）。解码不影响输出码流
+ *  的确定性；个别机型/内容硬解失败时自动退回软解重跑 */
+private fun hwDecoderFor(mime: String?): String? = when (mime) {
+    "video/avc" -> "h264_mediacodec"
+    "video/hevc" -> "hevc_mediacodec"
+    "video/x-vnd.on2.vp9" -> "vp9_mediacodec"
+    "video/av01" -> "av1_mediacodec"
+    else -> null
+}
 
 private fun rotationFilter(rotation: Int): String = when (rotation) {
     90 -> "transpose=1"
@@ -471,8 +483,23 @@ suspend fun transcodeConcat(
                 val seg = File(cacheDir, uniqueTempName("转码段", ".mp4"))
                 segments += seg
                 onProgress("自动转码中 第 ${i + 1}/${items.size} 段…")
-                transcodeSegment(context, item, infos[i], targetW, targetH, targetFps, seg) { pct ->
+                val progress: (Int) -> Unit = { pct ->
                     onProgress("自动转码中 第 ${i + 1}/${items.size} 段（$pct%）")
+                }
+                val hw = hwDecoderFor(infos[i].videoMime)
+                try {
+                    transcodeSegment(context, item, infos[i], targetW, targetH, targetFps, seg, hw, progress)
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    if (hw == null) throw t
+                    // 硬解不可用（机型不支持该编码/内容特殊/解码器会话紧张）：退软解重跑
+                    android.util.Log.w(
+                        "VideoStitcher",
+                        "hw decode ($hw) failed for ${item.name}, falling back to software",
+                        t
+                    )
+                    transcodeSegment(context, item, infos[i], targetW, targetH, targetFps, seg, null, progress)
                 }
             }
             val outTmp = File(cacheDir, uniqueTempName("转码成品", ".mp4"))
@@ -520,6 +547,7 @@ private suspend fun transcodeSegment(
     targetH: Int,
     targetFps: Float,
     out: File,
+    hwDecoder: String?,
     onSegProgress: (Int) -> Unit
 ) {
     val input = FFmpegKitConfig.getSafParameterForRead(context, item.uri)
@@ -535,7 +563,12 @@ private suspend fun transcodeSegment(
     val audioIn =
         if (info.hasAudio) ""
         else " -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -map 0:v -map 1:a -shortest"
-    val cmd = "-y -i $input$audioIn -vf $vf $TRANSCODE_VIDEO $TRANSCODE_AUDIO -sn -dn '${out.absolutePath}'"
+    // 硬解作为输入解码器（-c:v 在 -i 前是输入选项）：解码不影响输出码流，
+    // 省下的 CPU 全部让给 x264；失败由调用方退软解重跑。
+    // -filter_threads 0 = 滤镜（scale/pad 的 swscale）按 CPU 数切片多线程，
+    // 高分辨率源上缩放曾是最长的单线程段
+    val decodeOpt = if (hwDecoder != null) "-c:v $hwDecoder " else ""
+    val cmd = "-y -filter_threads 0 ${decodeOpt}-i $input$audioIn -vf $vf $TRANSCODE_VIDEO $TRANSCODE_AUDIO -sn -dn '${out.absolutePath}'"
     runFfmpeg(cmd, item.durationMs, onSegProgress)
 }
 
