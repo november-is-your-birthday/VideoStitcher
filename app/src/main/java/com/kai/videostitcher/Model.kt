@@ -3,8 +3,8 @@ package com.kai.videostitcher
 import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
-import android.media.ThumbnailUtils
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import android.util.LruCache
 import org.json.JSONArray
@@ -16,7 +16,10 @@ class Group(var name: String, val items: MutableList<VideoItem> = mutableListOf(
 
 /** 视频封面缩略图的内存缓存与加载 */
 object Thumbs {
-    private val cache = object : LruCache<String, Bitmap>(24 * 1024 * 1024) {
+    /** 缩略图最长边：卡片显示足够清晰，又不必解码整帧（4K 整帧一帧 30MB+） */
+    private const val MAX_DIM = 512
+
+    private val cache = object : LruCache<String, Bitmap>(32 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap) = value.byteCount
     }
 
@@ -24,17 +27,36 @@ object Thumbs {
 
     fun get(key: String): Bitmap? = cache.get(key)
 
+    /**
+     * 解码指定视频的缩略图：最长边 MAX_DIM、保持原始宽高比。
+     * @Synchronized 串行化解码：快速滚动时同一视频不会被并发重复解码，
+     * 几十个整帧解码同时跑挤爆 CPU/内存导致相册页卡顿的问题也从根上消除。
+     */
+    @Synchronized
     fun load(context: Context, uri: Uri): Bitmap? {
         cache.get(uri.toString())?.let { return it }
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(context, uri)
-            val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                ?: return null
-            val thumb = ThumbnailUtils.extractThumbnail(frame, 192, 120)
-            frame.recycle()
-            cache.put(uri.toString(), thumb)
-            thumb
+            val frame = if (Build.VERSION.SDK_INT >= 27) {
+                retriever.getScaledFrameAtTime(
+                    0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, MAX_DIM, MAX_DIM
+                )
+            } else {
+                retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)?.let { full ->
+                    val scale = MAX_DIM.toFloat() / maxOf(full.width, full.height)
+                    val small = Bitmap.createScaledBitmap(
+                        full,
+                        (full.width * scale).toInt().coerceAtLeast(1),
+                        (full.height * scale).toInt().coerceAtLeast(1),
+                        true
+                    )
+                    if (small != full) full.recycle()
+                    small
+                }
+            } ?: return null
+            cache.put(uri.toString(), frame)
+            frame
         } catch (t: Throwable) {
             null
         } finally {

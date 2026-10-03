@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.provider.MediaStore
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AbsListView
 import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.CheckBox
@@ -45,10 +46,23 @@ class AlbumPickerActivity : AppCompatActivity() {
         val folder: String
     )
 
+    /** 一行/一格的控件引用：避免 getView 里反复 findViewById，快速滚动更顺滑 */
+    private class AlbumViews(
+        val thumb: ImageView,
+        val name: TextView,
+        val info: TextView,
+        val cb: CheckBox
+    ) {
+        var item: AlbumItem? = null
+    }
+
     private val items = mutableListOf<AlbumItem>()
     private val selected = LinkedHashSet<Uri>()
     private var adapter: AlbumAdapter? = null
     private var viewMode = MODE_LIST
+
+    /** 滚动状态：快速滑动（FLING）时暂停解码缩略图，停下来再补，避免 CPU 争抢掉帧 */
+    private var scrollState = AbsListView.OnScrollListener.SCROLL_STATE_IDLE
 
     private lateinit var tvTitle: TextView
     private lateinit var btnConfirm: Button
@@ -110,6 +124,17 @@ class AlbumPickerActivity : AppCompatActivity() {
     private fun applyMode() {
         btnViewMode.text = if (viewMode == MODE_LIST) "▦ 大图" else "☰ 详细"
         adapter = AlbumAdapter(viewMode)
+        val scrollListener = object : AbsListView.OnScrollListener {
+            override fun onScrollStateChanged(view: AbsListView, state: Int) {
+                scrollState = state
+                // 滑动中跳过的缩略图，停下来补齐
+                if (state == AbsListView.OnScrollListener.SCROLL_STATE_IDLE) fillVisibleThumbs()
+            }
+
+            override fun onScroll(view: AbsListView, firstVisibleItem: Int, visibleItemCount: Int, totalItemCount: Int) {}
+        }
+        listView.setOnScrollListener(scrollListener)
+        gridView.setOnScrollListener(scrollListener)
         if (viewMode == MODE_LIST) {
             gridView.isVisible = false
             listView.isVisible = true
@@ -175,25 +200,43 @@ class AlbumPickerActivity : AppCompatActivity() {
         btnConfirm.text = if (selected.isEmpty()) "添加所选到新分组" else "添加所选（${selected.size} 个）到新分组"
     }
 
-    private fun bindItemView(view: View, item: AlbumItem, grid: Boolean) {
-        val thumb = view.findViewById<ImageView>(R.id.ivAlbumThumb)
+    private fun bindItemView(holder: AlbumViews, item: AlbumItem, grid: Boolean) {
+        holder.item = item
+        val thumb = holder.thumb
         thumb.tag = item.uri.toString()
-        Thumbs.get(item.uri)?.let { thumb.setImageBitmap(it) }
-        view.findViewById<TextView>(R.id.tvAlbumName).text = item.name
+        holder.name.text = item.name
         val d = formatDuration(item.durationMs)
-        view.findViewById<TextView>(R.id.tvAlbumInfo).text =
+        holder.info.text =
             (if (d.isEmpty()) "" else "$d · ") + if (grid) "" else item.folder.ifEmpty { "未知目录" }
-        view.findViewById<CheckBox>(R.id.cbAlbumPick).isChecked = item.uri in selected
+        holder.cb.isChecked = item.uri in selected
+        loadThumb(holder, item)
+    }
 
-        if (Thumbs.get(item.uri) == null) {
-            lifecycleScope.launch(Dispatchers.IO) {
-                val bmp = Thumbs.load(applicationContext, item.uri) ?: return@launch
-                withContext(Dispatchers.Main) {
-                    if (thumb.tag == item.uri.toString() && thumb.isAttachedToWindow) {
-                        thumb.setImageBitmap(bmp)
-                    }
+    private fun loadThumb(holder: AlbumViews, item: AlbumItem) {
+        val key = item.uri.toString()
+        Thumbs.get(item.uri)?.let {
+            holder.thumb.setImageBitmap(it)
+            return
+        }
+        // 复用的行先清掉上一条视频的封面，快速滚动时才不会显示错图
+        holder.thumb.setImageBitmap(null)
+        if (scrollState == AbsListView.OnScrollListener.SCROLL_STATE_FLING) return
+        lifecycleScope.launch(Dispatchers.IO) {
+            val bmp = Thumbs.load(applicationContext, item.uri) ?: return@launch
+            withContext(Dispatchers.Main) {
+                if (holder.thumb.tag == key && holder.thumb.isAttachedToWindow) {
+                    holder.thumb.setImageBitmap(bmp)
                 }
             }
+        }
+    }
+
+    /** 滑动结束后把当前可见行的缩略图补齐 */
+    private fun fillVisibleThumbs() {
+        val view = if (viewMode == MODE_LIST) listView else gridView
+        for (i in 0 until view.childCount) {
+            val holder = view.getChildAt(i)?.tag as? AlbumViews ?: continue
+            holder.item?.let { loadThumb(holder, it) }
         }
     }
 
@@ -204,9 +247,16 @@ class AlbumPickerActivity : AppCompatActivity() {
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val layout = if (mode == MODE_GRID) R.layout.item_album_grid else R.layout.item_album
-            val view = convertView
-                ?: layoutInflater.inflate(layout, parent, false)
-            bindItemView(view, items[position], mode == MODE_GRID)
+            val view = convertView ?: layoutInflater.inflate(layout, parent, false).also {
+                it.tag = AlbumViews(
+                    it.findViewById(R.id.ivAlbumThumb),
+                    it.findViewById(R.id.tvAlbumName),
+                    it.findViewById(R.id.tvAlbumInfo),
+                    it.findViewById(R.id.cbAlbumPick)
+                )
+            }
+            val holder = view.tag as AlbumViews
+            bindItemView(holder, items[position], mode == MODE_GRID)
             return view
         }
     }
