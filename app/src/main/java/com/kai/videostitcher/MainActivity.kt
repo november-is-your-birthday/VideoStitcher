@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ContentUris
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -24,6 +25,7 @@ import android.widget.Toast
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
@@ -31,9 +33,12 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -54,6 +59,7 @@ class MainActivity : AppCompatActivity() {
         private val successTextColor = Color.parseColor("#7BEFB4")
         private val errorTextColor = Color.parseColor("#FFB3BC")
         private val infoTextColor = Color.parseColor("#C9BEFF")
+        private val stoppedTextColor = Color.parseColor("#A3A3B8")
     }
 
     private class CardViews(
@@ -68,6 +74,8 @@ class MainActivity : AppCompatActivity() {
     private val cardViews = HashMap<Group, CardViews>()
     private val outputs: MutableList<Uri> = Collections.synchronizedList(mutableListOf())
     private var merging = false
+    /** 当前这轮拼接的协程；「停止拼接」对它 cancel，取消链路会清理半成品 */
+    private var mergeJob: Job? = null
 
     // ---- 删除源视频（拼接成功后可选）----
     private var deleteGroups: List<Group> = emptyList()
@@ -184,7 +192,7 @@ class MainActivity : AppCompatActivity() {
             // 极少数没有系统选择器的设备退回内置相册选择器兜底
             if (!merging) launchSystemVideoPicker()
         }
-        btnStart.setOnClickListener { onStartClicked() }
+        btnStart.setOnClickListener { if (merging) stopMerging() else onStartClicked() }
         btnOpenOutput.setOnClickListener { openLastOutput() }
 
         groups.addAll(Store.load(this))
@@ -425,8 +433,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun beginMerging() {
+        if (merging) return
         merging = true
         setUiEnabled(false)
+        // 拼接期间主按钮变成"停止拼接"，保持可点
+        btnStart.isEnabled = true
+        updateMergeButton()
         pbOverall.isVisible = true
         btnOpenOutput.isVisible = false
         outputs.clear()
@@ -435,50 +447,117 @@ class MainActivity : AppCompatActivity() {
         // 各组并行推进；Transformer 导出类工作由 Merger.exportGate 全局限 2 路，
         // 无损拼接只吃 IO 可完全并行
         val done = AtomicInteger(0)
-        lifecycleScope.launch(Dispatchers.IO) {
-            targets.map { group ->
-                launch(Dispatchers.IO) {
-                    try {
-                        val out = mergeGroup(group)
-                        outputs.add(out)
-                        succeeded.add(group)
-                    } catch (c: CancellationException) {
-                        // 取消不是失败：向上传播让 lifecycleScope 正常收尾，
-                        // 别把取消误标成"✗ 失败"
-                        throw c
-                    } catch (t: Throwable) {
-                        setGroupState(group, "✗ 失败：${t.message ?: t.javaClass.simpleName}", -1)
-                    } finally {
-                        val d = done.incrementAndGet()
-                        if (d < targets.size) {
-                            runOnUiThread { tvStatus.text = "拼接中…已完成 $d/${targets.size} 组" }
+        mergeJob = lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                targets.map { group ->
+                    launch(Dispatchers.IO) {
+                        try {
+                            val out = mergeGroup(group)
+                            outputs.add(out)
+                            succeeded.add(group)
+                        } catch (c: CancellationException) {
+                            // 取消不是失败：向上传播，别把取消误标成"✗ 失败"
+                            throw c
+                        } catch (t: Throwable) {
+                            setGroupState(group, "✗ 失败：${t.message ?: t.javaClass.simpleName}", -1)
+                        } finally {
+                            val d = done.incrementAndGet()
+                            // 被停止（isActive=false）时不再报"拼接中"进度，交收尾逻辑统一展示
+                            if (isActive && d < targets.size) {
+                                runOnUiThread { tvStatus.text = "拼接中…已完成 $d/${targets.size} 组" }
+                            }
                         }
                     }
-                }
-            }.joinAll()
-            withContext(Dispatchers.Main) {
-                merging = false
-                setUiEnabled(true)
-                pbOverall.isVisible = false
-                val ok = outputs.size
-                tvStatus.text = if (ok == targets.size)
-                    "全部完成！$ok 个成品已保存到 相册 → Movies/VideoStitcher"
-                else
-                    "完成 $ok/${targets.size}，失败的分组下方有提示。"
-                if (ok > 0) btnOpenOutput.isVisible = true
-                // 只有确认成功的组才点亮红色"删除原视频"，失败的组保持灰色。
-                // 立即落盘：进程被杀（崩溃/低内存）也不会把成功状态丢掉
-                succeeded.forEach { it.mergedOk = true }
-                Store.save(this@MainActivity, groups)
-                groups.forEach { g ->
-                    cardViews[g]?.let { cv ->
-                        val active = g.mergedOk && !merging
-                        cv.btnDeleteSources.isEnabled = active
-                        cv.btnDeleteSources.setTextColor(
-                            if (active) COLOR_DELETE_ON else COLOR_DELETE_OFF
-                        )
-                    }
-                }
+                }.joinAll()
+                withContext(Dispatchers.Main) { finishMergingUi(targets, succeeded) }
+            } catch (c: CancellationException) {
+                // 用户按了"停止拼接"（或页面销毁）：清点已完成的成品，
+                // 未完成分组的半成品文件已在各引擎的取消链路里删掉
+                withContext(NonCancellable + Dispatchers.Main) { onMergeStopped(targets, succeeded) }
+                throw c
+            }
+        }
+    }
+
+    /** 用户点击"停止拼接"：先弹窗确认防误触，确认后取消整轮拼接，半成品由取消链路自动清理 */
+    private fun stopMerging() {
+        if (!merging) return
+        AlertDialog.Builder(this)
+            .setTitle("停止拼接")
+            .setMessage("确定要停止拼接吗？\n\n未完成的半成品会被清理；已完成的成品保留在相册。")
+            .setPositiveButton("停止拼接") { _, _ ->
+                tvStatus.text = "正在停止并清理未完成的成品…"
+                mergeJob?.cancel()
+            }
+            .setNegativeButton("继续拼接", null)
+            .show()
+    }
+
+    private fun updateMergeButton() {
+        if (merging) {
+            btnStart.text = "停止拼接"
+            btnStart.backgroundTintList =
+                ColorStateList.valueOf(ContextCompat.getColor(this, R.color.danger))
+        } else {
+            btnStart.text = "开始拼接"
+            btnStart.backgroundTintList =
+                ColorStateList.valueOf(ContextCompat.getColor(this, R.color.brand_primary))
+        }
+    }
+
+    /** 一轮拼接正常收尾（全部跑完，含失败组） */
+    private fun finishMergingUi(targets: List<Group>, succeeded: List<Group>) {
+        merging = false
+        mergeJob = null
+        setUiEnabled(true)
+        pbOverall.isVisible = false
+        updateMergeButton()
+        val ok = outputs.size
+        tvStatus.text = if (ok == targets.size)
+            "全部完成！$ok 个成品已保存到 相册 → Movies/VideoStitcher"
+        else
+            "完成 $ok/${targets.size}，失败的分组下方有提示。"
+        if (ok > 0) btnOpenOutput.isVisible = true
+        // 只有确认成功的组才点亮红色"删除原视频"，失败的组保持灰色。
+        // 立即落盘：进程被杀（崩溃/低内存）也不会把成功状态丢掉
+        succeeded.forEach { it.mergedOk = true }
+        Store.save(this, groups)
+        refreshDeleteSourceButtons()
+    }
+
+    /** 用户停止后的收尾：已完成的成品保留，未完成的分组标"已停止" */
+    private fun onMergeStopped(targets: List<Group>, succeeded: List<Group>) {
+        if (!merging) return
+        merging = false
+        mergeJob = null
+        setUiEnabled(true)
+        pbOverall.isVisible = false
+        updateMergeButton()
+        val ok = succeeded.size
+        tvStatus.text = if (ok > 0)
+            "已停止拼接：$ok 组已完成（成品保留在相册），未完成的半成品已清理"
+        else
+            "已停止拼接，未完成的半成品已清理"
+        if (ok > 0) btnOpenOutput.isVisible = true
+        succeeded.forEach { it.mergedOk = true }
+        Store.save(this, groups)
+        refreshDeleteSourceButtons()
+        val okSet = succeeded.toSet()
+        for (g in targets) {
+            if (g in okSet) continue
+            val cv = cardViews[g] ?: continue
+            val cur = cv.statusText.text?.toString() ?: ""
+            if (cur.startsWith("✓") || cur.startsWith("✗")) continue
+            setGroupState(g, "已停止", -1)
+        }
+    }
+
+    private fun refreshDeleteSourceButtons() {
+        groups.forEach { g ->
+            cardViews[g]?.let { cv ->
+                val active = g.mergedOk && !merging
+                cv.btnDeleteSources.isEnabled = active
+                cv.btnDeleteSources.setTextColor(if (active) COLOR_DELETE_ON else COLOR_DELETE_OFF)
             }
         }
     }
@@ -805,11 +884,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setGroupState(group: Group, text: String, progress: Int?) {
+        // 拼接已结束时忽略迟到的进度回调：取消 ffmpeg 后其统计回调可能再触发一次，
+        // 把"已停止"覆盖回"自动转码中…"。收尾态（✓ / ✗ / 已停止）总是允许写入。
+        if (!merging && !text.startsWith("✓") && !text.startsWith("✗") && !text.startsWith("已停止")) return
         runOnUiThread {
             val cv = cardViews[group] ?: return@runOnUiThread
             cv.statusText.isVisible = true
             cv.statusText.text = text
-            // 状态胶囊按语义换色：✓ 成功→绿，✗ 失败→红，其余运行态→品牌紫
+            // 状态胶囊按语义换色：✓ 成功→绿，✗ 失败→红，已停止→灰，其余运行态→品牌紫
             when {
                 text.startsWith("✓") -> {
                     cv.statusText.setBackgroundResource(R.drawable.pill_success)
@@ -818,6 +900,10 @@ class MainActivity : AppCompatActivity() {
                 text.startsWith("✗") -> {
                     cv.statusText.setBackgroundResource(R.drawable.pill_error)
                     cv.statusText.setTextColor(errorTextColor)
+                }
+                text.startsWith("已停止") -> {
+                    cv.statusText.setBackgroundResource(R.drawable.pill_neutral)
+                    cv.statusText.setTextColor(stoppedTextColor)
                 }
                 else -> {
                     cv.statusText.setBackgroundResource(R.drawable.pill_info)
