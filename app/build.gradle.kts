@@ -19,6 +19,11 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // 用本机调试证书签名：Android 要求所有 APK 必须带签名才能安装，
+            // 未签名的 release 包在手机上会报"安装包缺乏开发者证书"。
+            // 调试证书长期稳定存在（~/.android/debug.keystore），同一台机器
+            // 后续构建签名一致，可直接覆盖升级，不必每次卸载重装。
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
