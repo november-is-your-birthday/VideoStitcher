@@ -1,3 +1,48 @@
-<resources>
-    <style name="Theme.VideoStitcher" parent="Theme.Material3.DayNight.NoActionBar" />
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.VideoStitcher" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/brand_primary</item>
+        <item name="colorOnPrimary">@color/brand_on_primary</item>
+        <item name="colorPrimaryContainer">@color/brand_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/brand_on_primary_container</item>
+        <item name="colorSecondary">@color/accent_gold</item>
+        <item name="colorOnSecondary">#1A1100</item>
+        <item name="colorSecondaryContainer">#4A3410</item>
+        <item name="colorOnSecondaryContainer">#FFDFA3</item>
+        <item name="colorError">@color/danger</item>
+        <item name="colorOnError">#FFFFFF</item>
+        <item name="colorErrorContainer">@color/danger_container</item>
+        <item name="colorOnErrorContainer">#FFD9DE</item>
+        <item name="android:colorBackground">@color/bg_root</item>
+        <item name="colorSurface">@color/bg_surface</item>
+        <item name="colorSurfaceContainer">@color/bg_surface_2</item>
+        <item name="colorOnSurface">@color/text_primary</item>
+        <item name="colorOnSurfaceVariant">@color/text_secondary</item>
+        <item name="colorOutline">@color/outline_subtle</item>
+        <item name="android:statusBarColor">@color/bg_root</item>
+        <item name="android:navigationBarColor">@color/bg_root</item>
+        <item name="android:windowBackground">@color/bg_root</item>
+        <item name="materialCardViewStyle">@style/Widget.VideoStitcher.Card</item>
+    </style>
+
+    <style name="Widget.VideoStitcher.Card" parent="Widget.Material3.CardView.Elevated">
+        <item name="cardBackgroundColor">@color/bg_surface</item>
+        <item name="cardCornerRadius">18dp</item>
+        <item name="cardElevation">0dp</item>
+        <item name="strokeColor">@color/outline_subtle</item>
+        <item name="strokeWidth">1dp</item>
+    </style>
+
+    <style name="Widget.VideoStitcher.Entry" parent="Widget.Material3.Button.TonalButton">
+        <item name="backgroundTint">@color/brand_primary_container</item>
+        <item name="android:textColor">@color/brand_on_primary_container</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="cornerRadius">16dp</item>
+        <item name="android:paddingTop">14dp</item>
+        <item name="android:paddingBottom">14dp</item>
+        <item name="android:textSize">12sp</item>
+        <item name="iconGravity">textStart</item>
+        <item name="iconPadding">6dp</item>
+        <item name="iconSize">18dp</item>
+    </style>
 </resources>

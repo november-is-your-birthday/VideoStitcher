@@ -1,27 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="110dp"
+    android:layout_height="118dp"
     android:layout_margin="3dp">
 
     <ImageView
         android:id="@+id/ivAlbumThumb"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="#EEEEEE"
-        android:scaleType="fitCenter" />
+        android:background="@drawable/thumb_frame"
+        android:scaleType="centerCrop" />
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
-        android:background="#99000000"
+        android:background="@drawable/scrim_bottom"
         android:gravity="center_vertical"
         android:orientation="horizontal"
-        android:paddingLeft="6dp"
-        android:paddingTop="3dp"
-        android:paddingRight="6dp"
-        android:paddingBottom="3dp">
+        android:paddingLeft="8dp"
+        android:paddingTop="4dp"
+        android:paddingRight="8dp"
+        android:paddingBottom="4dp">
 
         <TextView
             android:id="@+id/tvAlbumName"
@@ -31,7 +31,7 @@
             android:ellipsize="middle"
             android:maxLines="1"
             android:textColor="#FFFFFF"
-            android:textSize="12sp" />
+            android:textSize="11sp" />
 
         <TextView
             android:id="@+id/tvAlbumInfo"
@@ -39,7 +39,7 @@
             android:layout_height="wrap_content"
             android:layout_marginStart="6dp"
             android:textColor="#CCFFFFFF"
-            android:textSize="11sp" />
+            android:textSize="10sp" />
     </LinearLayout>
 
     <CheckBox
@@ -47,6 +47,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|end"
+        android:buttonTint="@color/brand_primary"
         android:clickable="false"
         android:focusable="false" />
 </FrameLayout>

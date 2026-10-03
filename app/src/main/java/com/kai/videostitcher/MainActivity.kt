@@ -49,8 +49,11 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "VideoStitcher"
         // "删除原视频"按钮：拼接成功前灰、成功后红
-        private val COLOR_DELETE_OFF = Color.parseColor("#9E9E9E")
-        private val COLOR_DELETE_ON = Color.parseColor("#D32F2F")
+        private val COLOR_DELETE_OFF = Color.parseColor("#5A5A6E")
+        private val COLOR_DELETE_ON = Color.parseColor("#FF5A6E")
+        private val successTextColor = Color.parseColor("#7BEFB4")
+        private val errorTextColor = Color.parseColor("#FFB3BC")
+        private val infoTextColor = Color.parseColor("#C9BEFF")
     }
 
     private class CardViews(
@@ -806,6 +809,21 @@ class MainActivity : AppCompatActivity() {
             val cv = cardViews[group] ?: return@runOnUiThread
             cv.statusText.isVisible = true
             cv.statusText.text = text
+            // 状态胶囊按语义换色：✓ 成功→绿，✗ 失败→红，其余运行态→品牌紫
+            when {
+                text.startsWith("✓") -> {
+                    cv.statusText.setBackgroundResource(R.drawable.pill_success)
+                    cv.statusText.setTextColor(successTextColor)
+                }
+                text.startsWith("✗") -> {
+                    cv.statusText.setBackgroundResource(R.drawable.pill_error)
+                    cv.statusText.setTextColor(errorTextColor)
+                }
+                else -> {
+                    cv.statusText.setBackgroundResource(R.drawable.pill_info)
+                    cv.statusText.setTextColor(infoTextColor)
+                }
+            }
             if (progress == null) {
                 cv.progressBar.isVisible = true
                 cv.progressBar.isIndeterminate = true

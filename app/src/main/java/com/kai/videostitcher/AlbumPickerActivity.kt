@@ -195,7 +195,7 @@ class AlbumPickerActivity : AppCompatActivity() {
     }
 
     private fun refreshHeader() {
-        tvTitle.text = "从相册选择（已选 ${selected.size} 个）"
+        tvTitle.text = "已选 ${selected.size} 个"
         btnConfirm.isEnabled = selected.isNotEmpty()
         btnConfirm.text = if (selected.isEmpty()) "添加所选到新分组" else "添加所选（${selected.size} 个）到新分组"
     }

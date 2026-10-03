@@ -5,47 +5,90 @@
     android:fitsSystemWindows="true"
     android:orientation="vertical">
 
+    <!-- 品牌标题区：大字号轻量字重 + 小标签，安静克制 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingLeft="20dp"
+        android:paddingTop="20dp"
+        android:paddingRight="20dp"
+        android:paddingBottom="4dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:letterSpacing="0.02"
+                android:text="批量视频拼接器"
+                android:textColor="@color/text_primary"
+                android:textSize="22sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@drawable/pill_info"
+                android:paddingLeft="10dp"
+                android:paddingTop="3dp"
+                android:paddingRight="10dp"
+                android:paddingBottom="3dp"
+                android:text="无损优先"
+                android:textColor="@color/brand_on_primary_container"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="秒拼 · 画质零损失 · 纯本地"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- 三入口：等宽胶囊，图标+主词，去掉长句 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:paddingLeft="12dp"
-        android:paddingTop="12dp"
-        android:paddingRight="12dp">
+        android:paddingLeft="16dp"
+        android:paddingTop="10dp"
+        android:paddingRight="16dp">
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnNewGroup"
+            style="@style/Widget.VideoStitcher.Entry"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginEnd="4dp"
+            android:layout_marginEnd="5dp"
             android:layout_weight="1"
-            android:paddingLeft="2dp"
-            android:paddingRight="2dp"
-            android:text="➕ 新建分组"
-            android:textSize="13sp" />
+            android:text="新建分组"
+             />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnAlbumPick"
+            style="@style/Widget.VideoStitcher.Entry"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginEnd="4dp"
-            android:layout_marginStart="4dp"
+            android:layout_marginStart="5dp"
+            android:layout_marginEnd="5dp"
             android:layout_weight="1"
-            android:paddingLeft="2dp"
-            android:paddingRight="2dp"
-            android:text="🎞 从相册选"
-            android:textSize="13sp" />
+            android:text="从相册选"
+             />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnImportFolders"
+            style="@style/Widget.VideoStitcher.Entry"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="4dp"
+            android:layout_marginStart="5dp"
             android:layout_weight="1"
-            android:paddingLeft="2dp"
-            android:paddingRight="2dp"
-            android:text="📂 从文件夹导入"
-            android:textSize="13sp" />
+            android:text="导入文件夹"
+             />
     </LinearLayout>
 
     <ScrollView
@@ -53,7 +96,10 @@
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:fillViewport="true">
+        android:clipToPadding="false"
+        android:fillViewport="true"
+        android:paddingTop="6dp"
+        android:scrollbars="none">
 
         <LinearLayout
             android:id="@+id/containerGroups"
@@ -69,17 +115,22 @@
         android:layout_height="0dp"
         android:layout_weight="1"
         android:gravity="center"
+        android:lineSpacingExtra="6dp"
         android:padding="32dp"
-        android:text="还没有分组。\n\n点上方「新建分组」可以多选几个视频拼成一个；\n点「从文件夹导入」时，每个子文件夹会自动变成一组。"
-        android:textColor="#888888"
-        android:textSize="15sp"
+        android:text="还没有分组\n\n从相册选几个视频，自动组成一组\n或导入文件夹，每个子文件夹一组"
+        android:textColor="@color/text_secondary"
+        android:textSize="14sp"
         android:visibility="gone" />
 
+    <!-- 底部操作区：主按钮占满 + 状态一行 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="12dp">
+        android:paddingLeft="16dp"
+        android:paddingTop="10dp"
+        android:paddingRight="16dp"
+        android:paddingBottom="14dp">
 
         <ProgressBar
             android:id="@+id/pbOverall"
@@ -87,30 +138,43 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:indeterminate="true"
+            android:progressDrawable="@drawable/progress_thin"
             android:visibility="gone" />
 
         <TextView
             android:id="@+id/tvStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="准备就绪：先添加分组，再点开始拼接"
-            android:textSize="13sp" />
+            android:layout_marginTop="4dp"
+            android:minHeight="18dp"
+            android:text="准备就绪"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnStart"
             android:layout_width="match_parent"
-            android:layout_height="56dp"
+            android:layout_height="58dp"
             android:layout_marginTop="8dp"
-            android:text="▶ 开始拼接"
-            android:textSize="16sp" />
+            android:backgroundTint="@color/brand_primary"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:text="开始拼接"
+            android:textColor="@color/brand_on_primary"
+            android:textSize="16sp"
+            android:textStyle="bold"
+             />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnOpenOutput"
             style="@style/Widget.Material3.Button.OutlinedButton"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:text="📁 打开相册（成品已保存到 Movies/VideoStitcher）"
-            android:visibility="gone" />
+            android:layout_height="48dp"
+            android:layout_marginTop="8dp"
+            android:text="打开相册查看成品"
+            android:textSize="13sp"
+            android:visibility="gone"
+            
+             />
     </LinearLayout>
 </LinearLayout>

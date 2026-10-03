@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 品牌色：胶片紫（视频剪辑的"轨道"意象） -->
+    <color name="brand_primary">#7C5CFF</color>
+    <color name="brand_primary_container">#2A2255</color>
+    <color name="brand_on_primary">#FFFFFF</color>
+    <color name="brand_on_primary_container">#E4DDFF</color>
+
+    <!-- 语义色 -->
+    <color name="accent_gold">#FFC24B</color>
+    <color name="danger">#FF5A6E</color>
+    <color name="danger_container">#3A1B22</color>
+    <color name="success">#39D98A</color>
+    <color name="success_container">#0F2E1F</color>
+    <color name="info_gray">#6C6C85</color>
+
+    <!-- 中性面板（夜色系） -->
+    <color name="bg_root">#0D0D13</color>
+    <color name="bg_surface">#15151E</color>
+    <color name="bg_surface_2">#1C1C28</color>
+    <color name="bg_scrim_thumb">#1F1F2C</color>
+    <color name="outline_subtle">#2A2A3A</color>
+
+    <color name="text_primary">#ECECF4</color>
+    <color name="text_secondary">#A3A3B8</color>
+    <color name="text_disabled">#5A5A6E</color>
+</resources>
