@@ -12,8 +12,8 @@ android {
         applicationId = "com.kai.videostitcher"
         minSdk = 24
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.4"
+        versionCode = 7
+        versionName = "1.5"
     }
 
     buildTypes {
@@ -50,4 +50,11 @@ dependencies {
 
     implementation("androidx.media3:media3-transformer:1.11.0")
     implementation("androidx.media3:media3-effect:1.11.0")
+
+    // ffmpeg-kit 社区续维护版（官方 com.arthenica 2025-01 退役）。
+    // full-gpl 含 libx264（GPL-3.0），包名/API 与官方一致（com.arthenica.ffmpegkit.*），
+    // 16KB 页对齐；ABI 仅 arm64-v8a/x86_64，32 位设备由 Merger.ffmpegAvailable() 降级
+    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full-gpl:8.1.7")
+    // ffmpeg-kit 的运行时依赖，fork 的 POM 没带，必须手动声明（缺了会 NoClassDefFoundError）
+    implementation("com.arthenica:smart-exception-java:0.2.0")
 }

@@ -6,6 +6,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.os.StatFs
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.View
@@ -351,6 +353,7 @@ class MainActivity : AppCompatActivity() {
         if (unreadable > 0) {
             throw IllegalStateException("有 $unreadable 个视频无法读取（可能已被移动、删除或授权失效），请把它们从分组中删除后重新添加")
         }
+        checkDiskSpace(group)
         setGroupState(group, "分析视频参数…", null)
         val infos = group.items.map {
             runCatching { probeVideo(this@MainActivity, it.uri) }.getOrElse { t ->
@@ -364,6 +367,7 @@ class MainActivity : AppCompatActivity() {
         val mp4Family = group.items.all { isLosslessCapableName(it.name) }
         // mp4parser 解析不了 AV1 的 av01 采样条目（实测抛异常），无损路径必须排除 AV1
         val hasAv1 = infos.any { it.videoMime == "video/av01" }
+        val probeFailed = infos.count { it.videoMime == null }
 
         var outUri = createOutputUri(this@MainActivity, sanitizeFileName("${group.name}_合并.mp4"))
         if (paramsUniform && mp4Family && !hasAv1) {
@@ -391,7 +395,7 @@ class MainActivity : AppCompatActivity() {
         // 上面的无损拼接，旋转矩阵在容器层原样保留）
         if (paramsUniform && isMp4MuxCompatible(infos) && infos.all { it.rotation == 0 }) {
             // 参数一致且编码能直封进 MP4（任意容器，含 MKV/WebM/TS/AV1）：
-            // 先试无损转封装（拷贝压缩流，不解码不重编码），失败再转码
+            // 直接拷贝压缩流换壳，不解码不重编码
             try {
                 transmuxConcat(this@MainActivity, group.items, outUri) { p ->
                     setGroupState(group, "无损转封装中 $p%…", p)
@@ -403,14 +407,61 @@ class MainActivity : AppCompatActivity() {
                 return outUri
             } catch (t: Throwable) {
                 android.util.Log.e(TAG, "transmux failed", t)
-                setGroupState(group, "转封装失败（${t.message ?: "格式不兼容"}）…", null)
+                setGroupState(group, "转封装失败（${t.message ?: "格式不兼容"}），尝试转码…", null)
             }
         }
-        // 走到这里 = 组内参数不一致或引擎处理不了。本 App 刻意不做转码：
-        // 真机上重新编码产出过无法播放/拉伸错乱的成品（1.2~1.3.1 的教训），
-        // 宁可中止让用户自行处理，也绝不交付坏文件
+        // 第三级（v1.5 新增）：参数不一致或前两级处理不了 → ffmpeg 逐段独立转码成
+        // 统一参数再拼。x264 软编全机型行为一致，绕开真机硬件会话差异的坑；
+        // 拼前有 SPS/PPS 闸门、拼后有成品自检，最坏情况是中止，不产出坏文件
+        if (probeFailed == 0) {
+            if (!ffmpegAvailable()) {
+                runCatching { contentResolver.delete(outUri, null, null) }
+                throw IllegalStateException(
+                    "这组视频参数不一致，而本机 CPU 架构不支持转码引擎（需要 64 位 ARM 或 x86_64 设备）。" +
+                        "请把它们自行转码成参数一致的普通 MP4 后再导入"
+                )
+            }
+            setGroupState(group, "自动转码拼接中…（较慢，约为视频时长）", null)
+            try {
+                transcodeConcat(this@MainActivity, group.items, infos, outUri) { msg ->
+                    setGroupState(group, msg, null)
+                }
+                setGroupState(group, "✓ 完成（转码拼接，已统一为 H.264+AAC）", 100)
+                return outUri
+            } catch (t: Throwable) {
+                android.util.Log.e(TAG, "transcode failed", t)
+                runCatching { contentResolver.delete(outUri, null, null) }
+                // 引擎级失败如实上报：报"参数不一致"会让用户白折腾一遍转码
+                throw IllegalStateException(
+                    "转码拼接失败：${t.message ?: t.javaClass.simpleName}", t
+                )
+            }
+        }
+        // 只有探测不动的输入才会走到这里（如网页下载/聊天转发的非常规封装）
         runCatching { contentResolver.delete(outUri, null, null) }
         throw IllegalStateException(inconsistentAdvice(infos))
+    }
+
+    /**
+     * 磁盘空间预检：无论无损还是转码，成品都是整文件写出；大分组峰值需要
+     * 约素材 1.3 倍空间。不足时开工前就报清楚，而不是半路 IOException
+     * 被误归成"格式不兼容"。
+     */
+    private fun checkDiskSpace(group: Group) {
+        val dir = getExternalFilesDir(null) ?: Environment.getExternalStorageDirectory() ?: return
+        val available = runCatching { StatFs(dir.path).availableBytes }.getOrDefault(Long.MAX_VALUE)
+        var needBytes = 0L
+        for (item in group.items) {
+            runCatching {
+                contentResolver.openFileDescriptor(item.uri, "r")?.use { needBytes += it.statSize }
+            }
+        }
+        needBytes = needBytes * 13 / 10 + 200L * 1024 * 1024
+        if (available < needBytes) {
+            throw IllegalStateException(
+                "存储空间不足：本组约需 ${needBytes / (1024 * 1024)}MB，设备可用 ${available / (1024 * 1024)}MB，请清理空间后重试"
+            )
+        }
     }
 
     private fun setGroupState(group: Group, text: String, progress: Int?) {

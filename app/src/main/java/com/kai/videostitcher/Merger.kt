@@ -7,7 +7,9 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.os.StatFs
 import android.provider.MediaStore
 import androidx.media3.common.MediaItem
 import androidx.media3.transformer.Composition
@@ -17,6 +19,12 @@ import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
+import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.FFmpegKitConfig
+import com.arthenica.ffmpegkit.FFmpegSession
+import com.arthenica.ffmpegkit.ReturnCode
+import com.arthenica.ffmpegkit.Statistics
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -28,6 +36,8 @@ import org.mp4parser.Container
 import org.mp4parser.IsoFile
 import org.mp4parser.PropertyBoxParserImpl
 import org.mp4parser.boxes.iso14496.part12.TrackBox
+import org.mp4parser.boxes.iso14496.part15.AvcConfigurationBox
+import org.mp4parser.boxes.sampleentry.VisualSampleEntry
 import org.mp4parser.muxer.Movie
 import org.mp4parser.muxer.RandomAccessSource
 import org.mp4parser.muxer.builder.DefaultMp4Builder
@@ -56,7 +66,9 @@ data class TrackInfo(
     val audioMime: String?,
     val sampleRate: Int,
     val channels: Int,
-    val hasAudio: Boolean
+    val hasAudio: Boolean,
+    val profile: Int = -1,
+    val hdr: Boolean = false
 ) {
     fun matches(o: TrackInfo): Boolean =
         videoMime == o.videoMime &&
@@ -64,7 +76,12 @@ data class TrackInfo(
             height == o.height &&
             rotation == o.rotation &&
             hasAudio == o.hasAudio &&
-            (!hasAudio || (audioMime == o.audioMime && sampleRate == o.sampleRate && channels == o.channels))
+            (!hasAudio || (audioMime == o.audioMime && sampleRate == o.sampleRate && channels == o.channels)) &&
+            // 编码 profile（如 H.265 Main 混 Main10）与 HDR 标记不一致时表面参数完全相同，
+            // AppendTrack 只保留第一段解码配置，拼出来会解不动/色彩错乱，必须分流到转码级。
+            // 个别机器不吐 KEY_PROFILE，此时无从比较，按一致处理（靠成品自检兜底）
+            (profile < 0 || o.profile < 0 || profile == o.profile) &&
+            hdr == o.hdr
     // 帧率不再要求一致：mp4parser/转封装都按各自的样本时长拼接（输出为可变帧率），
     // 23.976 与 24、不同拍摄帧率这类差异以前会被误判成"必须转码"，现在直接走无损秒拼。
     // 旋转角度必须一致：无损拼接只保留第一个视频的旋转矩阵，角度不同会横竖错乱
@@ -246,6 +263,8 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
         var audioMime: String? = null
         var sampleRate = 0
         var channels = 0
+        var profile = -1
+        var hdr = false
         for (i in 0 until extractor.trackCount) {
             val format = extractor.getTrackFormat(i)
             val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
@@ -255,12 +274,19 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
                 var h = if (format.containsKey(MediaFormat.KEY_HEIGHT)) format.getInteger(MediaFormat.KEY_HEIGHT) else 0
                 rotation =
                     if (format.containsKey(MediaFormat.KEY_ROTATION)) format.getInteger(MediaFormat.KEY_ROTATION) else 0
+                // 个别来源吐 -90，与 270 是同一个方向，归一到 0/90/180/270 再比较，
+                // 否则语义相同的两条竖拍视频会被误判为"方向不一致"
+                rotation = ((rotation % 360) + 360) % 360
                 if (rotation == 90 || rotation == 270) {
                     val t = w; w = h; h = t
                 }
                 width = w
                 height = h
                 fps = format.floatValue(MediaFormat.KEY_FRAME_RATE)
+                profile = if (format.containsKey(MediaFormat.KEY_PROFILE)) format.getInteger(MediaFormat.KEY_PROFILE) else -1
+                val transfer =
+                    if (format.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) format.getInteger(MediaFormat.KEY_COLOR_TRANSFER) else -1
+                hdr = transfer == MediaFormat.COLOR_TRANSFER_ST2084 || transfer == MediaFormat.COLOR_TRANSFER_HLG
             } else if (mime.startsWith("audio/") && audioMime == null) {
                 audioMime = mime
                 sampleRate =
@@ -269,7 +295,7 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
                     if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 0
             }
         }
-        return TrackInfo(videoMime, width, height, rotation, fps, audioMime, sampleRate, channels, audioMime != null)
+        return TrackInfo(videoMime, width, height, rotation, fps, audioMime, sampleRate, channels, audioMime != null, profile, hdr)
     } finally {
         extractor.release()
     }
@@ -391,6 +417,188 @@ suspend fun transmuxConcat(
     } finally {
         tmp.delete()
     }
+}
+
+/* ---------- 第三级：ffmpeg 转码兜底（v1.5） ----------
+ * 1.2~1.3.1 真机转码翻车的根因是"多项序列 + 硬件编码会话差异"：media3 对旋转元数据
+ * 处理不可靠、各硬件会话 SPS/PPS 有细微差异。这里换成 ffmpeg 逐段独立软编（x264 全机型
+ * 行为一致）、旋转用 transpose 亲手烤进像素、拼前再做 SPS/PPS 字节级比对——不确定点
+ * 全部变成确定性步骤，最坏情况是中止，不产出坏文件。 */
+
+/** ffmpeg-kit fork 只发布 arm64-v8a/x86_64 的 native 库；32 位设备调用会 UnsatisfiedLinkError，必须先守卫 */
+fun ffmpegAvailable(): Boolean =
+    Build.SUPPORTED_ABIS.any { it == "arm64-v8a" || it == "x86_64" }
+
+/** 转码目标统一为 H.264 High + AAC，固定 GOP；全组输出参数一致是拼前闸门能过的前提 */
+private const val TRANSCODE_VIDEO =
+    "-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -profile:v high -g 60"
+private const val TRANSCODE_AUDIO = "-c:a aac -ar 48000 -ac 2 -b:a 192k"
+
+private fun rotationFilter(rotation: Int): String = when (rotation) {
+    90 -> "transpose=1"
+    180 -> "transpose=1,transpose=1"
+    270 -> "transpose=2"
+    else -> ""
+}
+
+private fun trimFps(fps: Float): String =
+    "%.3f".format(fps).trimEnd('0').trimEnd('.').ifEmpty { "30" }
+
+/**
+ * 第三级引擎：逐段独立转码成统一参数（目标取第一段的显示分辨率/帧率，横竖混向按
+ * 各自 rotation 烤平），再容器级拼接。HDR→SDR 色调映射暂未做（已知限制，直转偏淡）。
+ */
+suspend fun transcodeConcat(
+    context: Context,
+    items: List<VideoItem>,
+    infos: List<TrackInfo>,
+    outUri: Uri,
+    onProgress: (String) -> Unit
+) {
+    exportGate.withPermit {
+        val target = infos.first()
+        val targetW = target.width.takeIf { it > 0 } ?: 1920
+        val targetH = target.height.takeIf { it > 0 } ?: 1080
+        val targetFps = target.fps.takeIf { it > 1f } ?: 30f
+        val cacheDir = context.cacheDir
+        val segments = mutableListOf<File>()
+        try {
+            for ((i, item) in items.withIndex()) {
+                val seg = File(cacheDir, uniqueTempName("转码段", ".mp4"))
+                segments += seg
+                onProgress("自动转码中 第 ${i + 1}/${items.size} 段…")
+                transcodeSegment(context, item, infos[i], targetW, targetH, targetFps, seg) { pct ->
+                    onProgress("自动转码中 第 ${i + 1}/${items.size} 段（$pct%）")
+                }
+            }
+            val outTmp = File(cacheDir, uniqueTempName("转码成品", ".mp4"))
+            try {
+                // 拼前参数集闸门（ROADMAP 预留）：各段 avcC 里的 SPS/PPS 字节一致才用
+                // mp4parser 追加；不一致退到 ffmpeg concat 重排——宁可多一步，不硬拼出解不动的流
+                val spsPps = segments.map { readAvcSpsPps(it) }
+                val uniformConfig = spsPps.all { it.isEmpty() } ||
+                    (spsPps.none { it.isEmpty() } && spsPps.all { listsEqual(it, spsPps.first()) })
+                if (uniformConfig) {
+                    val midItems = segments.map { VideoItem(Uri.fromFile(it), it.name, 0) }
+                    ParcelFileDescriptor.open(
+                        outTmp,
+                        ParcelFileDescriptor.MODE_READ_WRITE or
+                            ParcelFileDescriptor.MODE_CREATE or
+                            ParcelFileDescriptor.MODE_TRUNCATE
+                    ).use { pfd ->
+                        concatLossless(context, midItems, pfd)
+                    }
+                } else {
+                    ffmpegConcatCopy(segments, outTmp)
+                }
+                copyTmpToOut(context, outTmp, outUri)
+            } finally {
+                outTmp.delete()
+            }
+            val expectedDurationMs = items.sumOf { it.durationMs }
+            verifyOutputUsable(context, outUri, expectedDurationMs)?.let { reason ->
+                throw IllegalStateException("自检未通过：$reason")
+            }
+        } finally {
+            segments.forEach { runCatching { it.delete() } }
+        }
+    }
+}
+
+private fun listsEqual(a: List<ByteArray>, b: List<ByteArray>): Boolean =
+    a.size == b.size && a.zip(b).all { (x, y) -> x.contentEquals(y) }
+
+private suspend fun transcodeSegment(
+    context: Context,
+    item: VideoItem,
+    info: TrackInfo,
+    targetW: Int,
+    targetH: Int,
+    targetFps: Float,
+    out: File,
+    onSegProgress: (Int) -> Unit
+) {
+    val input = FFmpegKitConfig.getSafParameterForRead(context, item.uri)
+    val rot = rotationFilter(info.rotation)
+    // 先烤旋转再缩放：transpose 会交换宽高，pad 链的 W/H 是烤平后的显示方向目标
+    val vf = buildString {
+        if (rot.isNotEmpty()) append(rot).append(",")
+        append("scale=$targetW:$targetH:force_original_aspect_ratio=decrease,")
+        append("pad=$targetW:$targetH:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=")
+        append(trimFps(targetFps))
+    }
+    // 无声段补静音轨，保证拼出的成品音轨连续（AppendTrack 要求各组音轨结构一致）
+    val audioIn =
+        if (info.hasAudio) ""
+        else " -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -map 0:v -map 1:a -shortest"
+    val cmd = "-y -i $input$audioIn -vf $vf $TRANSCODE_VIDEO $TRANSCODE_AUDIO -sn -dn '${out.absolutePath}'"
+    runFfmpeg(cmd, item.durationMs, onSegProgress)
+}
+
+private suspend fun ffmpegConcatCopy(segments: List<File>, out: File) {
+    val list = File(out.parentFile, uniqueTempName("concat", ".txt"))
+    try {
+        list.writeText(
+            segments.joinToString("\n") { "file '${it.absolutePath.replace("'", "'\\''")}'" }
+        )
+        runFfmpeg(
+            "-y -f concat -safe 0 -i '${list.absolutePath}' -c copy -movflags +faststart '${out.absolutePath}'",
+            0
+        ) {}
+    } finally {
+        list.delete()
+    }
+}
+
+/** 同步等待一场 ffmpeg 执行；durationMs>0 时按已处理时长回报百分比进度 */
+private suspend fun runFfmpeg(
+    command: String,
+    durationMs: Long,
+    onProgress: (Int) -> Unit
+): Unit = withContext(Dispatchers.IO) {
+    val finished = CompletableDeferred<FFmpegSession>()
+    val session = FFmpegKit.executeAsync(
+        command,
+        { s -> finished.complete(s) },
+        null,
+        { stats ->
+            if (durationMs > 0) {
+                onProgress((stats.time * 100L / durationMs).toInt().coerceIn(0, 99))
+            }
+        }
+    )
+    try {
+        val s = finished.await()
+        if (!ReturnCode.isSuccess(s.returnCode)) {
+            val tail = runCatching { s.allLogsAsString.takeLast(300) }.getOrDefault("")
+            throw IllegalStateException("ffmpeg 失败（returnCode=${s.returnCode}）$tail")
+        }
+    } catch (e: CancellationException) {
+        // Activity 销毁会取消协程：同步取消 ffmpeg 会话，避免孤儿转码继续耗电耗盘
+        runCatching { FFmpegKit.cancel() }
+        throw e
+    }
+}
+
+/** 读出视频轨 avcC 里的 SPS/PPS 字节，用于拼前参数集比对；无视频轨或无 avcC 返回空表 */
+private fun readAvcSpsPps(file: File): List<ByteArray> {
+    FileInputStream(file).channel.use { ch ->
+        val parser = boxParser ?: return emptyList()
+        val iso = IsoFile(ch, parser)
+        for (trackBox in iso.movieBox.getBoxes(TrackBox::class.java)) {
+            if (trackBox.mediaBox.handlerBox.handlerType != "vide") continue
+            val sampleEntry = trackBox.mediaBox.mediaInformationBox.sampleTableBox
+                .sampleDescriptionBox.getBoxes(VisualSampleEntry::class.java).firstOrNull()
+                ?: return emptyList()
+            val avcC = sampleEntry.getBoxes(AvcConfigurationBox::class.java).firstOrNull()
+                ?.avcDecoderConfigurationRecord ?: return emptyList()
+            return (avcC.sequenceParameterSets + avcC.pictureParameterSets).map { buf ->
+                val dup = buf.duplicate()
+                ByteArray(dup.remaining()).also { dup.get(it) }
+            }
+        }
+    }
+    return emptyList()
 }
 
 /**
