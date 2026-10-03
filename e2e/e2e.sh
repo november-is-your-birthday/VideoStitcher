@@ -86,9 +86,11 @@ genmix() { # 桌面生成混合参数测试素材并推送到 /sdcard/Download/v
   # 1) 混编码：H.264 混 H.265（同分辨率 640x360）
   "$FF" -y -loglevel error $T=size=640x360:rate=30:duration=3 -pix_fmt yuv420p -c:v libx264 "$out/mix_codec/a_h264.mp4"
   "$FF" -y -loglevel error $T=size=640x360:rate=30:duration=3 -pix_fmt yuv420p -c:v libx265 -tag:v hvc1 "$out/mix_codec/b_hevc.mp4"
-  # 2) 混分辨率：1920x1080 混 1280x720（同为 H.264）→ 转码走 scale+pad 统一画布
-  "$FF" -y -loglevel error $T=size=1920x1080:rate=30:duration=2 -pix_fmt yuv420p -c:v libx264 "$out/mix_res/a_1080.mp4"
-  "$FF" -y -loglevel error $T=size=1280x720:rate=30:duration=3 -pix_fmt yuv420p -c:v libx264 "$out/mix_res/b_720.mp4"
+  # 2) 混分辨率混宽高比：640x480(4:3) 混 640x360(16:9)，同为 H.264 →
+  # 转码统一到 16:9 画布，scale+pad 黑边路径被真实触发（素材不超过 720p，
+  # 32 位 ffmpeg 在模拟器占用内存时编 1080p 会分配失败）
+  "$FF" -y -loglevel error $T=size=640x480:rate=30:duration=2 -pix_fmt yuv420p -c:v libx264 "$out/mix_res/a_480p43.mp4"
+  "$FF" -y -loglevel error $T=size=640x360:rate=30:duration=3 -pix_fmt yuv420p -c:v libx264 "$out/mix_res/b_360p169.mp4"
   # 3) 横竖混向：带 rotate=90 元数据的横拍 混 真竖拍像素（探测方向 90 vs 0）
   "$FF" -y -loglevel error $T=size=640x360:rate=30:duration=3 -pix_fmt yuv420p -c:v libx264 "$out/mix_rot/a_rot90.mp4"
   python "$DIR/patch_rotate.py" "$out/mix_rot/a_rot90.mp4" 90 >/dev/null
@@ -99,6 +101,9 @@ genmix() { # 桌面生成混合参数测试素材并推送到 /sdcard/Download/v
   # 5) 混容器+混编码：H.265 的 MKV 混 H.264 的 MP4
   "$FF" -y -loglevel error $T=size=640x360:rate=30:duration=3 -pix_fmt yuv420p -c:v libx265 "$out/mix_container/a_hevc.mkv"
   "$FF" -y -loglevel error $T=size=640x360:rate=30:duration=3 -pix_fmt yuv420p -c:v libx264 "$out/mix_container/b_h264.mp4"
+  local bad
+  bad=$(find "$out" -type f -size -2k)
+  [ -n "$bad" ] && { echo "GEN_CORRUPT: $bad"; return 1; }
   MSYS_NO_PATHCONV=1 "$ADB" push "$(cygpath -w "$out")" /sdcard/Download/ >/dev/null || { echo PUSH_FAIL; return 1; }
   echo GEN_OK
 }
@@ -111,9 +116,9 @@ import_folder() { # import_folder <name>：从文件夹导入 /sdcard/Download/<
   select_file "$1" || { echo NO_FOLDER; return 1; }
   sleep 2
   local ok=0 i
-  for i in 1 2 3 4 5; do
+  for i in 1 2 3 4 5 6 7 8; do
     if tap center_text "ALLOW"; then ok=1; break; fi
-    if tap center_tcon "此文件夹" || tap center_tcon "USE THIS"; then ok=1; break; fi
+    if tap center_tcon "此文件夹" || tap center_tcon "USE THIS" || tap center_text "USE THIS FOLDER"; then ok=1; break; fi
     sleep 2
   done
   [ "$ok" = "1" ] || { echo NO_USE_BTN; return 1; }

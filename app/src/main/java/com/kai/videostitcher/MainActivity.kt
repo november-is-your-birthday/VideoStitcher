@@ -25,6 +25,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -41,7 +42,8 @@ class MainActivity : AppCompatActivity() {
     private class CardViews(
         val progressBar: ProgressBar,
         val statusText: TextView,
-        val infoText: TextView
+        val infoText: TextView,
+        val fileDurationViews: List<TextView>
     )
 
     private val groups = mutableListOf<Group>()
@@ -195,7 +197,17 @@ class MainActivity : AppCompatActivity() {
                 if (item.codec.isEmpty()) item.codec = probeCodecSummary(this@MainActivity, item.uri)
             }
             withContext(Dispatchers.Main) {
-                if (!merging) render()
+                // 只更新受影响的文本，不整树 render()：render 会重建全部卡片，
+                // 把正在输入的分组名光标顶回开头，还会把缩略图加载整个重排一遍
+                val cv = cardViews[group] ?: return@withContext
+                val total = group.items.sumOf { it.durationMs }
+                cv.infoText.text =
+                    "${group.items.size} 个视频" + if (total > 0) " · 总时长 ${formatDuration(total)}" else ""
+                group.items.forEachIndexed { i, item ->
+                    cv.fileDurationViews.getOrNull(i)?.text =
+                        listOf(formatDuration(item.durationMs), item.codec)
+                            .filter { it.isNotEmpty() }.joinToString(" · ")
+                }
             }
         }
     }
@@ -238,6 +250,7 @@ class MainActivity : AppCompatActivity() {
         refreshInfo()
 
         val thumbViews = HashMap<String, ImageView>()
+        val fileDurationViews = mutableListOf<TextView>()
         group.items.forEachIndexed { index, item ->
             val row = layoutInflater.inflate(R.layout.view_file, llFiles, false)
             val thumb = row.findViewById<ImageView>(R.id.ivThumb)
@@ -248,6 +261,7 @@ class MainActivity : AppCompatActivity() {
             row.findViewById<TextView>(R.id.tvFileDuration).text =
                 listOf(formatDuration(item.durationMs), item.codec).filter { it.isNotEmpty() }
                     .joinToString(" · ")
+            fileDurationViews.add(row.findViewById(R.id.tvFileDuration))
             val up = row.findViewById<Button>(R.id.btnUp)
             val down = row.findViewById<Button>(R.id.btnDown)
             up.isEnabled = index > 0
@@ -284,7 +298,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        cardViews[group] = CardViews(pbGroup, tvStatusGroup, tvInfo)
+        cardViews[group] = CardViews(pbGroup, tvStatusGroup, tvInfo, fileDurationViews)
         return card
     }
 
@@ -363,89 +377,129 @@ class MainActivity : AppCompatActivity() {
         }
         val first = infos.first()
         val paramsUniform = infos.all { it.matches(first) }
-        val expectedDurationMs = group.items.sumOf { it.durationMs }
+        var expectedDurationMs = group.items.sumOf { it.durationMs }
+        if (expectedDurationMs <= 0) {
+            // 导入时的时长探测可能失败过（存了 0）：拼前补探，给自检一个时长基准，
+            // 否则成品截断检查会被静默跳过
+            expectedDurationMs = group.items.sumOf { item ->
+                if (item.durationMs > 0) item.durationMs else probeDuration(this@MainActivity, item.uri)
+            }
+        }
         val mp4Family = group.items.all { isLosslessCapableName(it.name) }
         // mp4parser 解析不了 AV1 的 av01 采样条目（实测抛异常），无损路径必须排除 AV1
         val hasAv1 = infos.any { it.videoMime == "video/av01" }
         val probeFailed = infos.count { it.videoMime == null }
-
-        var outUri = createOutputUri(this@MainActivity, sanitizeFileName("${group.name}_合并.mp4"))
-        if (paramsUniform && mp4Family && !hasAv1) {
-            setGroupState(group, "无损拼接中…（不重新编码，秒级完成）", null)
-            try {
-                contentResolver.openFileDescriptor(outUri, "rw")!!.use { pfd ->
-                    concatLossless(this@MainActivity, group.items, pfd)
-                }
-                // 成品必须自检通过：拼接"成功"不等于能播放，不过就降级下一档
-                verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs)?.let { reason ->
-                    throw IllegalStateException("自检未通过：$reason")
-                }
-                setGroupState(group, "✓ 完成（无损拼接，画质无损失）", 100)
-                return outUri
-            } catch (t: Throwable) {
-                android.util.Log.e(TAG, "lossless failed, trying alternatives", t)
-                runCatching { contentResolver.delete(outUri, null, null) }
-                // 重新创建输出条目，否则后续拼接无处可写
-                outUri = createOutputUri(this@MainActivity, sanitizeFileName("${group.name}_合并.mp4"))
-                setGroupState(group, "无损模式失败（${t.message ?: "格式不兼容"}），尝试其它方式…", null)
-            }
-        }
-        // 无损转封装只处理无旋转元数据的组：转封装走 media3 的序列管线，
-        // 对旋转元数据的携带在真机上不可靠（带旋转的组请用 MP4/MOV 原件走
-        // 上面的无损拼接，旋转矩阵在容器层原样保留）
-        if (paramsUniform && isMp4MuxCompatible(infos) && infos.all { it.rotation == 0 }) {
-            // 参数一致且编码能直封进 MP4（任意容器，含 MKV/WebM/TS/AV1）：
-            // 直接拷贝压缩流换壳，不解码不重编码
-            try {
-                transmuxConcat(this@MainActivity, group.items, outUri) { p ->
-                    setGroupState(group, "无损转封装中 $p%…", p)
-                }
-                verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs)?.let { reason ->
-                    throw IllegalStateException("自检未通过：$reason")
-                }
-                setGroupState(group, "✓ 完成（无损转封装，无重编码）", 100)
-                return outUri
-            } catch (t: Throwable) {
-                android.util.Log.e(TAG, "transmux failed", t)
-                setGroupState(group, "转封装失败（${t.message ?: "格式不兼容"}），尝试转码…", null)
-            }
-        }
-        // 第三级（v1.5 新增）：参数不一致或前两级处理不了 → ffmpeg 逐段独立转码成
-        // 统一参数再拼。x264 软编全机型行为一致，绕开真机硬件会话差异的坑；
-        // 拼前有 SPS/PPS 闸门、拼后有成品自检，最坏情况是中止，不产出坏文件
-        if (probeFailed == 0) {
-            if (!ffmpegAvailable()) {
-                runCatching { contentResolver.delete(outUri, null, null) }
-                throw IllegalStateException(
-                    "这组视频参数不一致，而本机 CPU 架构不支持转码引擎（需要 64 位 ARM 或 x86_64 设备）。" +
-                        "请把它们自行转码成参数一致的普通 MP4 后再导入"
-                )
-            }
-            setGroupState(group, "自动转码拼接中…（较慢，约为视频时长）", null)
-            try {
-                transcodeConcat(this@MainActivity, group.items, infos, outUri) { msg ->
-                    setGroupState(group, msg, null)
-                }
-                setGroupState(group, "✓ 完成（转码拼接，已统一为 H.264+AAC）", 100)
-                return outUri
-            } catch (t: Throwable) {
-                android.util.Log.e(TAG, "transcode failed", t)
-                runCatching { contentResolver.delete(outUri, null, null) }
-                // 引擎级失败如实上报：报"参数不一致"会让用户白折腾一遍转码
-                throw IllegalStateException(
-                    "转码拼接失败：${t.message ?: t.javaClass.simpleName}", t
-                )
-            }
-        }
-        // 只有探测不动的输入才会走到这里（如网页下载/聊天转发的非常规封装）
-        runCatching { contentResolver.delete(outUri, null, null) }
-        throw IllegalStateException(inconsistentAdvice(infos))
+        // 预判是否会落到转码级：转码的分段中间文件都写在 cacheDir（内置 data 分区），
+        // 与成品所在的共享存储是两个分区，可用空间常差好几倍，要分开查
+        val willTranscode = !(paramsUniform && mp4Family && !hasAv1) &&
+            !(paramsUniform && isMp4MuxCompatible(infos) && infos.all { it.rotation == 0 })
+        if (willTranscode) checkInternalDiskSpace(group)
+        return runMergeEngines(group, infos, expectedDurationMs, paramsUniform, mp4Family, hasAv1, probeFailed)
     }
 
     /**
-     * 磁盘空间预检：无论无损还是转码，成品都是整文件写出；大分组峰值需要
-     * 约素材 1.3 倍空间。不足时开工前就报清楚，而不是半路 IOException
-     * 被误归成"格式不兼容"。
+     * 三级引擎链：无损拼接 → 无损转封装 → ffmpeg 转码 → 中止。
+     * 成功返回输出 Uri。中途取消（旋转屏幕/退页面/后台被杀）会删掉已创建的
+     * 半截输出条目再向上传播取消——否则相册里会留下一个解不动的残缺 MP4。
+     */
+    private suspend fun runMergeEngines(
+        group: Group,
+        infos: List<TrackInfo>,
+        expectedDurationMs: Long,
+        paramsUniform: Boolean,
+        mp4Family: Boolean,
+        hasAv1: Boolean,
+        probeFailed: Int
+    ): Uri {
+        var outUri = createOutputUri(this@MainActivity, sanitizeFileName("${group.name}_合并.mp4"))
+        try {
+            if (paramsUniform && mp4Family && !hasAv1) {
+                setGroupState(group, "无损拼接中…（不重新编码，秒级完成）", null)
+                try {
+                    contentResolver.openFileDescriptor(outUri, "rw")!!.use { pfd ->
+                        concatLossless(this@MainActivity, group.items, pfd)
+                    }
+                    // 成品必须自检通过：拼接"成功"不等于能播放，不过就降级下一档
+                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs)?.let { reason ->
+                        throw IllegalStateException("自检未通过：$reason")
+                    }
+                    setGroupState(group, "✓ 完成（无损拼接，画质无损失）", 100)
+                    return outUri
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    android.util.Log.e(TAG, "lossless failed, trying alternatives", t)
+                    runCatching { contentResolver.delete(outUri, null, null) }
+                    // 重新创建输出条目，否则后续拼接无处可写
+                    outUri = createOutputUri(this@MainActivity, sanitizeFileName("${group.name}_合并.mp4"))
+                    setGroupState(group, "无损模式失败（${t.message ?: "格式不兼容"}），尝试其它方式…", null)
+                }
+            }
+            // 无损转封装只处理无旋转元数据的组：转封装走 media3 的序列管线，
+            // 对旋转元数据的携带在真机上不可靠（带旋转的组请用 MP4/MOV 原件走
+            // 上面的无损拼接，旋转矩阵在容器层原样保留）
+            if (paramsUniform && isMp4MuxCompatible(infos) && infos.all { it.rotation == 0 }) {
+                // 参数一致且编码能直封进 MP4（任意容器，含 MKV/WebM/TS/AV1）：
+                // 直接拷贝压缩流换壳，不解码不重编码
+                try {
+                    transmuxConcat(this@MainActivity, group.items, outUri) { p ->
+                        setGroupState(group, "无损转封装中 $p%…", p)
+                    }
+                    verifyOutputUsable(this@MainActivity, outUri, expectedDurationMs)?.let { reason ->
+                        throw IllegalStateException("自检未通过：$reason")
+                    }
+                    setGroupState(group, "✓ 完成（无损转封装，无重编码）", 100)
+                    return outUri
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    android.util.Log.e(TAG, "transmux failed", t)
+                    setGroupState(group, "转封装失败（${t.message ?: "格式不兼容"}），尝试转码…", null)
+                }
+            }
+            // 第三级（v1.5 新增）：参数不一致或前两级处理不了 → ffmpeg 逐段独立转码成
+            // 统一参数再拼。x264 软编全机型行为一致，绕开真机硬件会话差异的坑；
+            // 拼前有 SPS/PPS 闸门、拼后有成品自检，最坏情况是中止，不产出坏文件
+            if (probeFailed == 0) {
+                if (!ffmpegAvailable()) {
+                    runCatching { contentResolver.delete(outUri, null, null) }
+                    throw IllegalStateException(
+                        "这组视频参数不一致，而本机 CPU 架构不支持转码引擎（需要 64 位 ARM 或 x86_64 设备）。" +
+                            "请把它们自行转码成参数一致的普通 MP4 后再导入"
+                    )
+                }
+                setGroupState(group, "自动转码拼接中…（较慢，约为视频时长）", null)
+                try {
+                    transcodeConcat(this@MainActivity, group.items, infos, outUri) { msg ->
+                        setGroupState(group, msg, null)
+                    }
+                    setGroupState(group, "✓ 完成（转码拼接，已统一为 H.264+AAC）", 100)
+                    return outUri
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    android.util.Log.e(TAG, "transcode failed", t)
+                    runCatching { contentResolver.delete(outUri, null, null) }
+                    // 引擎级失败如实上报：failureDetail 带上错误码提示、内层原因
+                    // 和组内检测（文档承诺过的格式），不再光秃秃一个异常消息
+                    throw IllegalStateException(
+                        "转码拼接失败：${failureDetail(t, infos)}", t
+                    )
+                }
+            }
+            // 只有探测不动的输入才会走到这里（如网页下载/聊天转发的非常规封装）
+            runCatching { contentResolver.delete(outUri, null, null) }
+            throw IllegalStateException(inconsistentAdvice(infos))
+        } catch (c: CancellationException) {
+            runCatching { contentResolver.delete(outUri, null, null) }
+            throw c
+        }
+    }
+
+    /**
+     * 磁盘空间预检（成品输出卷）：无论无损还是转码，成品都是整文件写到
+     * MediaStore（共享存储）；大分组峰值需要约素材 1.3 倍空间。不足时开工前
+     * 就报清楚，而不是半路 IOException 被误归成"格式不兼容"。
      */
     private fun checkDiskSpace(group: Group) {
         val dir = getExternalFilesDir(null) ?: Environment.getExternalStorageDirectory() ?: return
@@ -460,6 +514,27 @@ class MainActivity : AppCompatActivity() {
         if (available < needBytes) {
             throw IllegalStateException(
                 "存储空间不足：本组约需 ${needBytes / (1024 * 1024)}MB，设备可用 ${available / (1024 * 1024)}MB，请清理空间后重试"
+            )
+        }
+    }
+
+    /**
+     * 转码分区的预检：转码的分段中间文件与拼接临时件都写在 cacheDir（内置
+     * data 分区），和共享存储不是一个卷，可用空间常差好几倍，必须单独查。
+     */
+    private fun checkInternalDiskSpace(group: Group) {
+        val available = runCatching { StatFs(cacheDir.path).availableBytes }.getOrDefault(Long.MAX_VALUE)
+        var needBytes = 0L
+        for (item in group.items) {
+            runCatching {
+                contentResolver.openFileDescriptor(item.uri, "r")?.use { needBytes += it.statSize }
+            }
+        }
+        needBytes = needBytes * 13 / 10 + 200L * 1024 * 1024
+        if (available < needBytes) {
+            throw IllegalStateException(
+                "存储空间不足（应用数据分区）：本组转码约需 ${needBytes / (1024 * 1024)}MB，" +
+                    "该分区可用 ${available / (1024 * 1024)}MB，请清理空间后重试"
             )
         }
     }

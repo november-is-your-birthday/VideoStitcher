@@ -48,6 +48,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
+import java.util.Locale
 
 /** 全局导出闸门：Transformer 导出（转封装）最多 2 路并发，匹配手机硬件编码器实例数；
  *  mp4parser 无损拼接只吃 IO，不占闸门，可任意并行。 */
@@ -204,6 +205,7 @@ fun verifyOutputUsable(context: Context, uri: Uri, expectedDurationMs: Long): St
             mmr.setDataSource(context, uri)
             val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: return "读不到成品时长"
+            if (durMs <= 0) return "成品时长为 ${durMs}ms"
             if (expectedDurationMs > 0 && durMs < expectedDurationMs * 85 / 100)
                 return "成品时长 ${durMs}ms 明显短于素材总时长 ${expectedDurationMs}ms（内容被截断）"
             val hasVideo =
@@ -442,7 +444,9 @@ private fun rotationFilter(rotation: Int): String = when (rotation) {
 }
 
 private fun trimFps(fps: Float): String =
-    "%.3f".format(fps).trimEnd('0').trimEnd('.').ifEmpty { "30" }
+    // 必须 Locale.US：逗号小数点地区（德/法/西等）默认格式化出 "30,000"，
+    // ffmpeg 滤镜图解析直接失败
+    String.format(Locale.US, "%.3f", fps).trimEnd('0').trimEnd('.').ifEmpty { "30" }
 
 /**
  * 第三级引擎：逐段独立转码成统一参数（目标取第一段的显示分辨率/帧率，横竖混向按
@@ -574,8 +578,9 @@ private suspend fun runFfmpeg(
             throw IllegalStateException("ffmpeg 失败（returnCode=${s.returnCode}）$tail")
         }
     } catch (e: CancellationException) {
-        // Activity 销毁会取消协程：同步取消 ffmpeg 会话，避免孤儿转码继续耗电耗盘
-        runCatching { FFmpegKit.cancel() }
+        // Activity 销毁会取消协程：只取消自己这场会话。FFmpegKit.cancel() 无参重载
+        // 是全局的，会把同时段其它分组并行转码一起掐掉
+        runCatching { FFmpegKit.cancel(session.sessionId) }
         throw e
     }
 }
