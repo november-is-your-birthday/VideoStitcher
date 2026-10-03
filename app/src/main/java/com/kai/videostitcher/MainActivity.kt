@@ -20,6 +20,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -94,6 +95,27 @@ class MainActivity : AppCompatActivity() {
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             if (!uris.isNullOrEmpty()) addNewGroup(uris)
         }
+    // 系统照片选择器（Android 13+ 标准组件）：选视频走它，与其它应用的体验一致。
+    // 多选上限必须 ≤ getPickImagesMaxLimit()（通常 100），超了 launch 时直接抛异常
+    private val systemPickerMaxItems =
+        if (Build.VERSION.SDK_INT >= 33) MediaStore.getPickImagesMaxLimit() else 100
+    private val pickVisualVideos =
+        registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(systemPickerMaxItems)) { uris ->
+            if (!uris.isNullOrEmpty()) addGroupFromPicker(uris)
+        }
+    // 老系统的系统相册多选（ACTION_PICK，调起厂商相册的选择界面）
+    private val pickFromSystemGallery =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+            if (res.resultCode == RESULT_OK) {
+                val data = res.data ?: return@registerForActivityResult
+                val uris = mutableListOf<Uri>()
+                data.clipData?.let { cd ->
+                    for (i in 0 until cd.itemCount) uris.add(cd.getItemAt(i).uri)
+                }
+                if (uris.isEmpty()) data.data?.let { uris.add(it) }
+                if (uris.isNotEmpty()) addGroupFromPicker(uris)
+            }
+        }
     private val pickTree =
         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
             if (uri != null) importFromFolder(uri)
@@ -104,13 +126,7 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 val uris = res.data?.getParcelableArrayListExtra<Uri>(AlbumPickerActivity.EXTRA_URIS)
                 if (uris.isNullOrEmpty()) return@registerForActivityResult
-                val fresh = uris.filter { u -> groups.none { g -> g.items.any { it.uri == u } } }
-                if (fresh.isEmpty()) {
-                    toast("所选视频都已经在分组里了")
-                    return@registerForActivityResult
-                }
-                if (fresh.size < uris.size) toast("已跳过 ${uris.size - fresh.size} 个重复视频")
-                addNewGroup(fresh)
+                addGroupFromPicker(uris)
             }
         }
     private val storagePermission =
@@ -156,7 +172,9 @@ class MainActivity : AppCompatActivity() {
             if (!merging) pickTree.launch(null)
         }
         findViewById<Button>(R.id.btnAlbumPick).setOnClickListener {
-            if (!merging) albumPick.launch(Intent(this, AlbumPickerActivity::class.java))
+            // "从相册选"走系统照片选择器（与其它应用的体验一致）；
+            // 极少数没有系统选择器的设备退回内置相册选择器兜底
+            if (!merging) launchSystemVideoPicker()
         }
         btnStart.setOnClickListener { onStartClicked() }
         btnOpenOutput.setOnClickListener { openLastOutput() }
@@ -172,6 +190,39 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         Store.save(this, groups)
+    }
+
+    /**
+     * "从相册选"走系统照片选择器，与其它应用的体验一致：
+     * Android 13+ 用系统照片选择器（多选上限取系统限制），老系统调厂商相册的
+     * 多选（ACTION_PICK + EXTRA_ALLOW_MULTIPLE）。极少数没有系统选择器的设备
+     * 退回内置相册选择器兜底（保留 OriginOS 阉割版 SAF 场景的可用性）。
+     */
+    private fun launchSystemVideoPicker() {
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                pickVisualVideos.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
+                )
+            } else {
+                val intent = Intent(Intent.ACTION_PICK, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                    .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                pickFromSystemGallery.launch(intent)
+            }
+        } catch (t: Throwable) {
+            runCatching { albumPick.launch(Intent(this, AlbumPickerActivity::class.java)) }
+                .onFailure { toast("无法打开相册选择器") }
+        }
+    }
+
+    private fun addGroupFromPicker(uris: List<Uri>) {
+        val fresh = uris.filter { u -> groups.none { g -> g.items.any { it.uri == u } } }
+        if (fresh.isEmpty()) {
+            toast("所选视频都已经在分组里了")
+            return
+        }
+        if (fresh.size < uris.size) toast("已跳过 ${uris.size - fresh.size} 个重复视频")
+        addNewGroup(fresh)
     }
 
     private fun addNewGroup(uris: List<Uri>) {
