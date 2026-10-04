@@ -1,27 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 品牌色：胶片紫（视频剪辑的"轨道"意象） -->
-    <color name="brand_primary">#7C5CFF</color>
-    <color name="brand_primary_container">#2A2255</color>
+    <!-- 品牌色：石墨蓝绿（主操作 = 绿，进度/主按钮） -->
+    <color name="brand_primary">#1AAB77</color>
+    <color name="brand_primary_container">#17493A</color>
     <color name="brand_on_primary">#FFFFFF</color>
-    <color name="brand_on_primary_container">#E4DDFF</color>
+    <color name="brand_on_primary_container">#BDEBD6</color>
+
+    <!-- 三个入口按钮配色 -->
+    <color name="entry_green">#1AAB77</color>
+    <color name="entry_teal">#008B85</color>
+    <color name="entry_yellow">#DED833</color>
+    <color name="entry_on_yellow">#2F4858</color>
+    <color name="info_container">#0E4A47</color>
+    <color name="info_text">#9FE3DC</color>
 
     <!-- 语义色 -->
-    <color name="accent_gold">#FFC24B</color>
+    <color name="accent_gold">#DED833</color>
     <color name="danger">#FF5A6E</color>
-    <color name="danger_container">#3A1B22</color>
+    <color name="danger_container">#4A2430</color>
     <color name="success">#39D98A</color>
-    <color name="success_container">#0F2E1F</color>
-    <color name="info_gray">#6C6C85</color>
+    <color name="success_container">#12402E</color>
+    <color name="info_gray">#5E7B8C</color>
 
-    <!-- 中性面板（夜色系） -->
-    <color name="bg_root">#0D0D13</color>
-    <color name="bg_surface">#15151E</color>
-    <color name="bg_surface_2">#1C1C28</color>
-    <color name="bg_scrim_thumb">#1F1F2C</color>
-    <color name="outline_subtle">#2A2A3A</color>
+    <!-- 中性面板（石板蓝灰系） -->
+    <color name="bg_root">#2F4858</color>
+    <color name="bg_surface">#3B596D</color>
+    <color name="bg_surface_2">#45647A</color>
+    <color name="bg_scrim_thumb">#243B49</color>
+    <color name="outline_subtle">#4E7085</color>
 
-    <color name="text_primary">#ECECF4</color>
-    <color name="text_secondary">#A3A3B8</color>
-    <color name="text_disabled">#5A5A6E</color>
+    <color name="text_primary">#ECF2F5</color>
+    <color name="text_secondary">#AFC3CE</color>
+    <color name="text_disabled">#71889A</color>
 </resources>

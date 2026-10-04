@@ -54,12 +54,12 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "VideoStitcher"
         // "删除原视频"按钮：拼接成功前灰、成功后红
-        private val COLOR_DELETE_OFF = Color.parseColor("#5A5A6E")
+        private val COLOR_DELETE_OFF = Color.parseColor("#71889A")
         private val COLOR_DELETE_ON = Color.parseColor("#FF5A6E")
         private val successTextColor = Color.parseColor("#7BEFB4")
         private val errorTextColor = Color.parseColor("#FFB3BC")
-        private val infoTextColor = Color.parseColor("#C9BEFF")
-        private val stoppedTextColor = Color.parseColor("#A3A3B8")
+        private val infoTextColor = Color.parseColor("#9FE3DC")
+        private val stoppedTextColor = Color.parseColor("#AFC3CE")
     }
 
     private class CardViews(
@@ -671,7 +671,7 @@ class MainActivity : AppCompatActivity() {
         fun sectionLabel(text: String, topPad: Int = 0) = TextView(this).apply {
             this.text = text
             textSize = 12f
-            setTextColor(Color.parseColor("#A3A3B8"))
+            setTextColor(Color.parseColor("#AFC3CE"))
             setPadding(0, topPad, 0, 0)
         }
         fun radioGroup(names: Array<String>, checkedIndex: Int, onPick: (Int) -> Unit) =
@@ -695,7 +695,7 @@ class MainActivity : AppCompatActivity() {
             text = "仅对参数不一致、需要转码的分组生效；无损拼接的分组永远保持原画质不变。" +
                 "自动模式下编码不统一的分组按数量最多者输出（平票取 H.264）。"
             textSize = 12f
-            setTextColor(Color.parseColor("#A3A3B8"))
+            setTextColor(Color.parseColor("#AFC3CE"))
             setPadding(0, 24, 0, 0)
         })
 

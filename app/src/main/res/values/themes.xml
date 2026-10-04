@@ -5,9 +5,9 @@
         <item name="colorPrimaryContainer">@color/brand_primary_container</item>
         <item name="colorOnPrimaryContainer">@color/brand_on_primary_container</item>
         <item name="colorSecondary">@color/accent_gold</item>
-        <item name="colorOnSecondary">#1A1100</item>
-        <item name="colorSecondaryContainer">#4A3410</item>
-        <item name="colorOnSecondaryContainer">#FFDFA3</item>
+        <item name="colorOnSecondary">#2F4858</item>
+        <item name="colorSecondaryContainer">#1E4F41</item>
+        <item name="colorOnSecondaryContainer">#BDEBD6</item>
         <item name="colorError">@color/danger</item>
         <item name="colorOnError">#FFFFFF</item>
         <item name="colorErrorContainer">@color/danger_container</item>

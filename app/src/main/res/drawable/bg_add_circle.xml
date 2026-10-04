@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 分组卡片右下角的圆形"+"按钮：品牌紫圆底 + 白色按压涟漪 -->
+<!-- 分组卡片右下角的圆形"+"按钮：明黄圆底 + 深色按压涟漪 -->
 <ripple xmlns:android="http://schemas.android.com/apk/res/android"
-    android:color="#40FFFFFF">
+    android:color="#402F4858">
     <item>
         <shape android:shape="oval">
-            <solid android:color="@color/brand_primary" />
+            <solid android:color="@color/entry_yellow" />
         </shape>
     </item>
 </ripple>
