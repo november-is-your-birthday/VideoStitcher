@@ -40,12 +40,11 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Collections
-import java.util.concurrent.atomic.AtomicInteger
+import androidx.documentfile.provider.DocumentFile
 import android.app.RecoverableSecurityException
 import android.provider.DocumentsContract
 import android.provider.MediaStore
@@ -77,6 +76,8 @@ class MainActivity : AppCompatActivity() {
     private var merging = false
     /** 当前这轮拼接的协程；「停止拼接」对它 cancel，取消链路会清理半成品 */
     private var mergeJob: Job? = null
+    /** 分组卡片圆形"+"选中的目标组：非空时选择器返回的视频追加进该组，空则新建分组 */
+    private var pendingAddTarget: Group? = null
 
     // ---- 删除源视频（拼接成功后可选）----
     private var deleteGroups: List<Group> = emptyList()
@@ -108,9 +109,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnOpenOutput: Button
     private lateinit var btnNewGroup: Button
 
-    private val pickVideos =
-        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-            if (!uris.isNullOrEmpty()) addNewGroup(uris)
+    // 「从文件夹导入」：系统文件夹选择器，所选文件夹（不含子文件夹）里的视频
+    // 整体导入为一个新分组
+    private val pickTree =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri != null) importFromFolder(uri)
         }
     // 系统照片选择器（Android 13+ 标准组件）：选视频走它，与其它应用的体验一致。
     // 多选上限必须 ≤ getPickImagesMaxLimit()（通常 100），超了 launch 时直接抛异常
@@ -179,7 +182,7 @@ class MainActivity : AppCompatActivity() {
         btnNewGroup = findViewById(R.id.btnNewGroup)
 
         btnNewGroup.setOnClickListener {
-            if (!merging) pickVideos.launch(arrayOf("video/*"))
+            if (!merging) pickTree.launch(null)
         }
         findViewById<Button>(R.id.btnAlbumPick).setOnClickListener {
             // "从相册选"走系统照片选择器（与其它应用的体验一致）；
@@ -188,7 +191,7 @@ class MainActivity : AppCompatActivity() {
         }
         btnStart.setOnClickListener { if (merging) stopMerging() else onStartClicked() }
         btnOpenOutput.setOnClickListener { openLastOutput() }
-        findViewById<TextView>(R.id.btnOutputSettings).setOnClickListener { showOutputSettingsDialog() }
+        findViewById<Button>(R.id.btnOutputSettings).setOnClickListener { showOutputSettingsDialog() }
         refreshOutputSettingsLabel()
 
         groups.addAll(Store.load(this))
@@ -209,8 +212,10 @@ class MainActivity : AppCompatActivity() {
      * Android 13+ 用系统照片选择器（多选上限取系统限制），老系统调厂商相册的
      * 多选（ACTION_PICK + EXTRA_ALLOW_MULTIPLE）。极少数没有系统选择器的设备
      * 退回内置相册选择器兜底（保留 OriginOS 阉割版 SAF 场景的可用性）。
+     * target 非空 = 分组卡片圆形"+"触发，选完的视频追加进该组。
      */
-    private fun launchSystemVideoPicker() {
+    private fun launchSystemVideoPicker(target: Group? = null) {
+        pendingAddTarget = target
         try {
             if (Build.VERSION.SDK_INT >= 33) {
                 pickVisualVideos.launch(
@@ -228,13 +233,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun addGroupFromPicker(uris: List<Uri>) {
+        val target = pendingAddTarget
+        pendingAddTarget = null
         val fresh = uris.filter { u -> groups.none { g -> g.items.any { it.uri == u } } }
         if (fresh.isEmpty()) {
             toast("所选视频都已经在分组里了")
             return
         }
         if (fresh.size < uris.size) toast("已跳过 ${uris.size - fresh.size} 个重复视频")
-        addNewGroup(fresh)
+        if (target != null && groups.contains(target)) {
+            // 分组卡片右下角圆形"+"：往该组追加视频。内容变了，已拼接状态失效
+            // （红色"删除原视频"退回灰色），重新拼接成功后才会再点亮
+            fresh.forEach {
+                runCatching {
+                    contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            }
+            fresh.forEachIndexed { i, u ->
+                target.items.add(VideoItem(u, queryDisplayName(this, u, "视频${i + 1}.mp4"), 0))
+            }
+            target.mergedOk = false
+            render()
+            fillDurationsAsync(target)
+        } else {
+            addNewGroup(fresh)
+        }
     }
 
     private fun addNewGroup(uris: List<Uri>) {
@@ -246,10 +269,52 @@ class MainActivity : AppCompatActivity() {
         val items = uris.mapIndexed { i, u ->
             VideoItem(u, queryDisplayName(this, u, "视频${i + 1}.mp4"), 0)
         }.sortedWith { a, b -> naturalCompare(a.name, b.name) }
-        val group = Group("组${groups.size + 1}", items.toMutableList())
+        addNewGroupItems(items, null)
+    }
+
+    private fun addNewGroupItems(items: List<VideoItem>, name: String?) {
+        val group = Group(name ?: "组${groups.size + 1}", items.toMutableList())
         groups.add(group)
         render()
         fillDurationsAsync(group)
+    }
+
+    /**
+     * 「从文件夹导入」：列出所选文件夹（不含子文件夹）里的视频，按文件名自然
+     * 排序（01、02、10）整体导入为一个新分组，分组名默认用文件夹名。
+     * 目录授权做持久化：应用重启后分组里的视频仍然可读可拼。
+     */
+    private fun importFromFolder(treeUri: Uri) {
+        runCatching {
+            contentResolver.takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        lifecycleScope.launch(Dispatchers.IO) {
+            val items = runCatching {
+                val root = DocumentFile.fromTreeUri(this@MainActivity, treeUri)
+                    ?: error("无法访问所选文件夹")
+                root.listFiles()
+                    .filter {
+                        it.isFile &&
+                            (it.type?.startsWith("video/") == true || isVideoName(it.name ?: ""))
+                    }
+                    .map { VideoItem(it.uri, it.name ?: "视频.mp4", 0) }
+                    .sortedWith { a, b -> naturalCompare(a.name, b.name) }
+            }.getOrElse { t ->
+                android.util.Log.e(TAG, "folder import failed", t)
+                emptyList()
+            }
+            withContext(Dispatchers.Main) {
+                if (items.isEmpty()) {
+                    toast("这个文件夹里没有可导入的视频")
+                    return@withContext
+                }
+                val docId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+                val folderName = docId?.substringAfter(':')
+                    ?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+                addNewGroupItems(items, folderName)
+                toast("已导入「${folderName ?: "所选文件夹"}」的 ${items.size} 个视频")
+            }
+        }
     }
 
     private fun fillDurationsAsync(group: Group) {
@@ -316,6 +381,20 @@ class MainActivity : AppCompatActivity() {
         btnDeleteSources.setOnClickListener {
             if (merging || !group.mergedOk) return@setOnClickListener
             startDeletion(listOf(group))
+        }
+
+        // 右下角圆形"+"：往这个分组补充视频（选择器多选，追加到列表末尾）
+        card.findViewById<TextView>(R.id.btnAddVideos).setOnClickListener {
+            if (merging) return@setOnClickListener
+            launchSystemVideoPicker(target = group)
+        }
+
+        // 已拼接成功的组亮出完成态：这类组不会被重复拼接
+        if (group.mergedOk) {
+            tvStatusGroup.isVisible = true
+            tvStatusGroup.text = "✓ 已完成拼接"
+            tvStatusGroup.setBackgroundResource(R.drawable.pill_success)
+            tvStatusGroup.setTextColor(successTextColor)
         }
 
         fun refreshInfo() {
@@ -487,6 +566,11 @@ class MainActivity : AppCompatActivity() {
             toast("请先添加视频")
             return
         }
+        // 已拼接成功的分组本轮不会重复拼接；一组都不用拼就直接说明
+        if (groups.none { it.items.isNotEmpty() && !it.mergedOk }) {
+            toast("所有分组都已拼接完成，不会重复拼接\n往分组补充视频或调整顺序后可重新拼接")
+            return
+        }
         if (Build.VERSION.SDK_INT < 29 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
             != PackageManager.PERMISSION_GRANTED
@@ -507,33 +591,40 @@ class MainActivity : AppCompatActivity() {
         pbOverall.isVisible = true
         btnOpenOutput.isVisible = false
         outputs.clear()
-        val targets = groups.filter { it.items.isNotEmpty() }
-        val succeeded = Collections.synchronizedList(mutableListOf<Group>())
-        // 各组并行推进；Transformer 导出类工作由 Merger.exportGate 全局限 2 路，
-        // 无损拼接只吃 IO 可完全并行
-        val done = AtomicInteger(0)
+        // 只拼还没拼成功的分组：mergedOk 的组保留成品原样不动
+        val targets = groups.filter { it.items.isNotEmpty() && !it.mergedOk }
+        val succeeded = mutableListOf<Group>()
         mergeJob = lifecycleScope.launch(Dispatchers.IO) {
             try {
-                targets.map { group ->
-                    launch(Dispatchers.IO) {
-                        try {
-                            val out = mergeGroup(group)
-                            outputs.add(out)
-                            succeeded.add(group)
-                        } catch (c: CancellationException) {
-                            // 取消不是失败：向上传播，别把取消误标成"✗ 失败"
-                            throw c
-                        } catch (t: Throwable) {
-                            setGroupState(group, "✗ 失败：${t.message ?: t.javaClass.simpleName}", -1)
-                        } finally {
-                            val d = done.incrementAndGet()
-                            // 被停止（isActive=false）时不再报"拼接中"进度，交收尾逻辑统一展示
-                            if (isActive && d < targets.size) {
-                                runOnUiThread { tvStatus.text = "拼接中…已完成 $d/${targets.size} 组" }
+                // 多个分组按列表顺序逐组拼接：一次只跑一组，状态一目了然，
+                // 单组也能吃满解码/转码资源，多组并行互相抢 CPU 反而更慢
+                for ((idx, group) in targets.withIndex()) {
+                    try {
+                        val out = mergeGroup(group)
+                        outputs.add(out)
+                        succeeded.add(group)
+                        // 顺序拼接完成一组点亮一组：立即标记成功并落盘，
+                        // 进程被杀（崩溃/低内存）也不会把成功状态丢掉
+                        withContext(NonCancellable + Dispatchers.Main) {
+                            group.mergedOk = true
+                            Store.save(this@MainActivity, groups)
+                            refreshDeleteSourceButtons()
+                            if (idx < targets.size - 1) {
+                                tvStatus.text = "拼接中…已完成 ${idx + 1}/${targets.size} 组"
+                            }
+                        }
+                    } catch (c: CancellationException) {
+                        // 取消不是失败：向上传播，别把取消误标成"✗ 失败"
+                        throw c
+                    } catch (t: Throwable) {
+                        setGroupState(group, "✗ 失败：${t.message ?: t.javaClass.simpleName}", -1)
+                        if (idx < targets.size - 1) {
+                            withContext(Dispatchers.Main) {
+                                tvStatus.text = "拼接中…已完成 ${idx}/${targets.size} 组"
                             }
                         }
                     }
-                }.joinAll()
+                }
                 withContext(Dispatchers.Main) { finishMergingUi(targets, succeeded) }
             } catch (c: CancellationException) {
                 // 用户按了"停止拼接"（或页面销毁）：清点已完成的成品，
@@ -551,7 +642,7 @@ class MainActivity : AppCompatActivity() {
         val codec = when (s.codecMode) {
             "h265" -> "H.265"; "av1" -> "AV1"; "h264" -> "H.264"; else -> "自动跟随源"
         }
-        findViewById<TextView>(R.id.btnOutputSettings).text = "输出设置：$res · $codec（仅转码组生效）"
+        findViewById<Button>(R.id.btnOutputSettings).text = "输出设置：$res · $codec（仅转码组生效）"
     }
 
     /** 输出设置对话框：分辨率压缩 + 编码格式。只影响需要转码的分组 */

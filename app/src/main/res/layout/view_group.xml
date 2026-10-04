@@ -86,17 +86,35 @@
             android:progressDrawable="@drawable/progress_thin"
             android:visibility="gone" />
 
-        <Button
-            android:id="@+id/btnDeleteSources"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="wrap_content"
+        <!-- 底部一行：左侧"删除原视频"，右下角圆形"+"往该分组补充视频 -->
+        <FrameLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_gravity="end"
-            android:layout_marginTop="2dp"
-            android:minWidth="0dp"
-            android:text="删除原视频"
-            android:textColor="@color/text_disabled"
-            android:textSize="12sp"
-             />
+            android:layout_marginTop="2dp">
+
+            <Button
+                android:id="@+id/btnDeleteSources"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="start|center_vertical"
+                android:minWidth="0dp"
+                android:text="删除原视频"
+                android:textColor="@color/text_disabled"
+                android:textSize="12sp"
+                 />
+
+            <TextView
+                android:id="@+id/btnAddVideos"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_gravity="end|center_vertical"
+                android:background="@drawable/bg_add_circle"
+                android:contentDescription="往这个分组添加视频"
+                android:gravity="center"
+                android:text="+"
+                android:textColor="@color/brand_on_primary"
+                android:textSize="22sp" />
+        </FrameLayout>
     </LinearLayout>
 </com.google.android.material.card.MaterialCardView>

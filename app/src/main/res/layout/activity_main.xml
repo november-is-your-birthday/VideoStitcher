@@ -68,7 +68,7 @@
             android:layout_width="0dp"
             android:layout_marginEnd="5dp"
             android:layout_weight="1"
-            android:text="新建分组"
+            android:text="从文件夹导入"
              />
 
         <com.google.android.material.button.MaterialButton
@@ -80,6 +80,21 @@
             android:text="从相册选"
              />
     </LinearLayout>
+
+    <!-- 输出设置入口（仅影响需要转码的分组，无损拼接永远原画质）：
+         与上面两个入口同样的圆角方框样式，放在显眼位置 -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnOutputSettings"
+        style="@style/Widget.VideoStitcher.Entry"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginLeft="16dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginRight="16dp"
+        android:paddingTop="10dp"
+        android:paddingBottom="10dp"
+        android:text="输出设置：原尺寸 · 自动跟随源"
+        android:textSize="12sp" />
 
     <ScrollView
         android:id="@+id/scrollGroups"
@@ -107,7 +122,7 @@
         android:gravity="center"
         android:lineSpacingExtra="6dp"
         android:padding="32dp"
-        android:text="还没有分组\n\n从相册选几个视频，自动组成一组\n或导入文件夹，每个子文件夹一组"
+        android:text="还没有分组\n\n从文件夹导入一组视频\n或从相册挑选视频新建分组"
         android:textColor="@color/text_secondary"
         android:textSize="14sp"
         android:visibility="gone" />
@@ -139,18 +154,6 @@
             android:minHeight="18dp"
             android:text="准备就绪"
             android:textColor="@color/text_secondary"
-            android:textSize="12sp" />
-
-        <!-- 输出设置入口：仅影响需要转码的分组，无损拼接永远保持原画质 -->
-        <TextView
-            android:id="@+id/btnOutputSettings"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:paddingTop="6dp"
-            android:paddingBottom="6dp"
-            android:text="输出设置：原尺寸 · H.264"
-            android:textColor="@color/brand_primary"
             android:textSize="12sp" />
 
         <com.google.android.material.button.MaterialButton

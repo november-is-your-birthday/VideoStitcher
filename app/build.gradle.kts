@@ -12,8 +12,8 @@ android {
         applicationId = "com.kai.videostitcher"
         minSdk = 24
         targetSdk = 36
-        versionCode = 17
-        versionName = "1.7.0"
+        versionCode = 18
+        versionName = "1.8.0"
     }
 
     buildTypes {
