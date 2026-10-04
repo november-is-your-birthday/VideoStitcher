@@ -1,17 +1,18 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Theme.VideoStitcher" parent="Theme.Material3.Dark.NoActionBar">
+    <!-- 黑白极简主题：DayNight 双模式，颜色全部来自 values / values-night 的资源 -->
+    <style name="Theme.VideoStitcher" parent="Theme.Material3.DayNight.NoActionBar">
         <item name="colorPrimary">@color/brand_primary</item>
         <item name="colorOnPrimary">@color/brand_on_primary</item>
         <item name="colorPrimaryContainer">@color/brand_primary_container</item>
         <item name="colorOnPrimaryContainer">@color/brand_on_primary_container</item>
         <item name="colorSecondary">@color/accent_gold</item>
-        <item name="colorOnSecondary">#2F4858</item>
-        <item name="colorSecondaryContainer">#1E4F41</item>
-        <item name="colorOnSecondaryContainer">#BDEBD6</item>
+        <item name="colorOnSecondary">@color/brand_on_primary</item>
+        <item name="colorSecondaryContainer">@color/brand_primary_container</item>
+        <item name="colorOnSecondaryContainer">@color/brand_on_primary_container</item>
         <item name="colorError">@color/danger</item>
         <item name="colorOnError">#FFFFFF</item>
         <item name="colorErrorContainer">@color/danger_container</item>
-        <item name="colorOnErrorContainer">#FFD9DE</item>
+        <item name="colorOnErrorContainer">@color/text_primary</item>
         <item name="android:colorBackground">@color/bg_root</item>
         <item name="colorSurface">@color/bg_surface</item>
         <item name="colorSurfaceContainer">@color/bg_surface_2</item>
@@ -35,7 +36,6 @@
     <style name="Widget.VideoStitcher.Entry" parent="Widget.Material3.Button.TonalButton">
         <item name="backgroundTint">@color/brand_primary_container</item>
         <item name="android:textColor">@color/brand_on_primary_container</item>
-        <item name="android:textSize">13sp</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="cornerRadius">16dp</item>
         <item name="android:paddingTop">14dp</item>

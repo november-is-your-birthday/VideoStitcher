@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 分组卡片右下角的圆形"+"按钮：明黄圆底 + 深色按压涟漪 -->
+<!-- 分组卡片右下角的圆形"+"按钮：主色实心圆（白天黑/夜晚白） -->
 <ripple xmlns:android="http://schemas.android.com/apk/res/android"
-    android:color="#402F4858">
+    android:color="@color/ripple_generic">
     <item>
         <shape android:shape="oval">
-            <solid android:color="@color/entry_yellow" />
+            <solid android:color="@color/brand_primary" />
         </shape>
     </item>
 </ripple>

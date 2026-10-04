@@ -73,7 +73,7 @@
             android:paddingTop="4dp"
             android:paddingRight="12dp"
             android:paddingBottom="4dp"
-            android:textColor="@color/info_text"
+            android:textColor="@color/text_secondary"
             android:textSize="12sp"
             android:visibility="gone" />
 
@@ -113,7 +113,7 @@
                 android:contentDescription="往这个分组添加视频"
                 android:gravity="center"
                 android:text="+"
-                android:textColor="@color/entry_on_yellow"
+                android:textColor="@color/brand_on_primary"
                 android:textSize="22sp" />
         </FrameLayout>
     </LinearLayout>

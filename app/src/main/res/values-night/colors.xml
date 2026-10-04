@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 黑白极简 · 黑夜模式：全暗灰色阶，无纯色白，保证低亮度 -->
+    <color name="bg_root">#0C0C0D</color>
+    <color name="bg_surface">#19191B</color>
+    <color name="bg_surface_2">#232326</color>
+    <color name="bg_scrim_thumb">#202023</color>
+    <color name="outline_subtle">#2B2B2F</color>
+
+    <color name="text_primary">#C9C9CE</color>
+    <color name="text_secondary">#8E8E95</color>
+    <color name="text_disabled">#57575D</color>
+
+    <color name="brand_primary">#3A3A3F</color>
+    <color name="brand_on_primary">#C9C9CE</color>
+    <color name="brand_primary_container">#232326</color>
+    <color name="brand_on_primary_container">#C9C9CE</color>
+    <color name="accent_solid">#3A3A3F</color>
+    <color name="on_accent_solid">#C9C9CE</color>
+    <color name="accent_gold">#4A4A50</color>
+    <color name="ripple_generic">#26C9C9CE</color>
+
+    <color name="danger">#E5656F</color>
+    <color name="danger_container">#33262A</color>
+    <color name="success">#58D69A</color>
+    <color name="success_container">#163022</color>
+    <color name="info_gray">#6E6E75</color>
+</resources>

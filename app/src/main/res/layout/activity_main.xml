@@ -32,6 +32,17 @@
                 android:textStyle="bold" />
 
             <TextView
+                android:id="@+id/btnNightMode"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:layout_marginEnd="6dp"
+                android:contentDescription="切换深色/浅色模式"
+                android:gravity="center"
+                android:text="☾"
+                android:textColor="@color/text_secondary"
+                android:textSize="18sp" />
+
+            <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:background="@drawable/pill_info"
@@ -40,7 +51,7 @@
                 android:paddingRight="10dp"
                 android:paddingBottom="3dp"
                 android:text="无损优先"
-                android:textColor="@color/info_text"
+                android:textColor="@color/text_secondary"
                 android:textSize="11sp" />
         </LinearLayout>
 
@@ -68,9 +79,7 @@
             android:layout_width="0dp"
             android:layout_marginEnd="5dp"
             android:layout_weight="1"
-            android:backgroundTint="@color/entry_green"
             android:text="从文件夹导入"
-            android:textColor="#FFFFFF"
              />
 
         <com.google.android.material.button.MaterialButton
@@ -79,9 +88,7 @@
             android:layout_width="0dp"
             android:layout_marginStart="5dp"
             android:layout_weight="1"
-            android:backgroundTint="@color/entry_teal"
             android:text="从相册选"
-            android:textColor="#FFFFFF"
              />
     </LinearLayout>
 
@@ -95,11 +102,9 @@
         android:layout_marginLeft="16dp"
         android:layout_marginTop="8dp"
         android:layout_marginRight="16dp"
-        android:backgroundTint="@color/entry_yellow"
         android:paddingTop="10dp"
         android:paddingBottom="10dp"
         android:text="输出设置：原尺寸 · 自动跟随源"
-        android:textColor="@color/entry_on_yellow"
         android:textSize="12sp" />
 
     <ScrollView
