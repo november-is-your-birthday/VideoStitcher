@@ -37,6 +37,7 @@ import org.mp4parser.IsoFile
 import org.mp4parser.PropertyBoxParserImpl
 import org.mp4parser.boxes.iso14496.part12.TrackBox
 import org.mp4parser.boxes.iso14496.part15.AvcConfigurationBox
+import org.mp4parser.boxes.iso14496.part15.HevcConfigurationBox
 import org.mp4parser.boxes.sampleentry.VisualSampleEntry
 import org.mp4parser.muxer.Movie
 import org.mp4parser.muxer.RandomAccessSource
@@ -475,6 +476,92 @@ private const val TRANSCODE_VIDEO =
     "-c:v libx264 -preset superfast -crf 19 -pix_fmt yuv420p -profile:v high -g 60"
 private const val TRANSCODE_AUDIO = "-c:a aac -ar 48000 -ac 2 -b:a 192k"
 
+/** 转码视频编码参数（v1.7 起可选 H.264/H.265/AV1）。x265 同等观感 crf 比 x264 高约 5；
+ *  svtav1 preset 8 兼顾速度与压缩率，crf 32 与 x264 crf 19 观感相近 */
+private fun transcodeVideoOpts(codec: String): String = when (codec) {
+    // bframes=0：部分解码器（含模拟器 SW HEVC 解码）对 x265 B 帧流 seek 解码不稳，
+    // 关掉换取兼容性（体积略增）；hvc1 = 参数集只放 hvcC，iOS/微信兼容
+    "h265" -> "-c:v libx265 -preset superfast -crf 24 -pix_fmt yuv420p -tag:v hvc1 -g 60 -x265-params bframes=0"
+    "av1" -> av1VideoOpts()
+    else -> TRANSCODE_VIDEO
+}
+
+/** AV1 编码器探测：优先 libsvtav1（快），退 libaom-av1（慢），都无则回退 H.264。
+ *  ffmpeg -encoders 只查一次并缓存（结果进程内不变） */
+@Volatile
+private var av1EncoderArg: String? = null
+
+private fun av1VideoOpts(): String {
+    av1EncoderArg?.let { return it }
+    val arg = runCatching {
+        val session = FFmpegKit.execute("-hide_banner -encoders")
+        val out = session.allLogsAsString ?: ""
+        when {
+            out.contains("libsvtav1") ->
+                "-c:v libsvtav1 -preset 8 -crf 32 -pix_fmt yuv420p -g 60"
+            out.contains("libaom-av1") ->
+                "-c:v libaom-av1 -crf 30 -cpu-used 6 -row-mt 1 -pix_fmt yuv420p -g 60"
+            else -> TRANSCODE_VIDEO
+        }
+    }.getOrDefault(TRANSCODE_VIDEO)
+    av1EncoderArg = arg
+    return arg
+}
+
+/** AV1 编码是否可用（设置界面展示用）；探测结果与 av1VideoOpts 共享缓存 */
+fun av1EncodeAvailable(): Boolean =
+    av1VideoOpts() != TRANSCODE_VIDEO
+
+/**
+ * 转码输出设置（仅转码组生效，无损路径不重编码不受影响）。
+ * shortEdge：输出短边上限（0=保持原尺寸；1080/720=把超过限制的源缩到该短边）。
+ * codecMode："auto"=跟随组内源编码（混合时少数服从多数，平票取 H.264），
+ * 或固定 "h264"/"h265"/"av1"。
+ */
+data class TranscodeSettings(val shortEdge: Int, val codecMode: String)
+
+fun loadTranscodeSettings(context: Context): TranscodeSettings {
+    val p = context.getSharedPreferences("output_settings", Context.MODE_PRIVATE)
+    // 旧版本只存 h265 布尔：迁移成 codecMode 后移除旧键
+    if (p.contains("h265")) {
+        val mode = if (p.getBoolean("h265", false)) "h265" else "h264"
+        saveTranscodeSettings(context, TranscodeSettings(p.getInt("shortEdge", 0), mode))
+    }
+    return TranscodeSettings(
+        p.getInt("shortEdge", 0).coerceIn(0, 2160),
+        p.getString("codecMode", "auto") ?: "auto"
+    )
+}
+
+fun saveTranscodeSettings(context: Context, settings: TranscodeSettings) {
+    context.getSharedPreferences("output_settings", Context.MODE_PRIVATE).edit()
+        .putInt("shortEdge", settings.shortEdge)
+        .putString("codecMode", settings.codecMode)
+        .remove("h265")
+        .apply()
+}
+
+/** 源编码 mime → 输出编码名（自动模式下参与计数）；不在表里的编码视作 H.264 */
+private fun outputCodecOf(mime: String?): String = when (mime) {
+    "video/hevc" -> "h265"
+    "video/av01" -> "av1"
+    else -> "h264"
+}
+
+/** "auto" 模式解析组内实际输出编码：少数服从多数；平票取更低世代
+ *  （H.264 低于 H.265 低于 AV1——老设备兼容面大、软解省电），即 h264 > h265 > av1 */
+fun resolveOutputCodec(infos: List<TrackInfo>, settings: TranscodeSettings): String {
+    if (settings.codecMode != "auto") return settings.codecMode
+    val counts = infos.groupingBy { outputCodecOf(it.videoMime) }.eachCount()
+    val max = counts.values.maxOrNull() ?: return "h264"
+    val winners = counts.filterValues { it == max }.keys
+    return when {
+        "h264" in winners -> "h264"
+        "h265" in winners -> "h265"
+        else -> "av1"
+    }
+}
+
 /** 源编码 → MediaCodec 硬解码器（fork 只带硬解不带硬编）。解码不影响输出码流
  *  的确定性；个别机型/内容硬解失败时自动退回软解重跑 */
 private fun hwDecoderFor(mime: String?): String? = when (mime) {
@@ -493,6 +580,7 @@ private fun trimFps(fps: Float): String =
 /**
  * 第三级引擎：逐段独立转码成统一参数（目标取第一段的显示分辨率/帧率，横竖混向按
  * 各自 rotation 烤平），再容器级拼接。HDR→SDR 色调映射暂未做（已知限制，直转偏淡）。
+ * 返回实际使用的视频编码名（"h264"/"h265"/"av1"，供完成文案展示）。
  */
 suspend fun transcodeConcat(
     context: Context,
@@ -500,11 +588,23 @@ suspend fun transcodeConcat(
     infos: List<TrackInfo>,
     outUri: Uri,
     onProgress: (String) -> Unit
-) {
+): String {
     exportGate.withPermit {
+        val settings = loadTranscodeSettings(context)
+        val codec = resolveOutputCodec(infos, settings)
         val target = infos.first()
-        val targetW = target.width.takeIf { it > 0 } ?: 1920
-        val targetH = target.height.takeIf { it > 0 } ?: 1080
+        var targetW = target.width.takeIf { it > 0 } ?: 1920
+        var targetH = target.height.takeIf { it > 0 } ?: 1080
+        // 分辨率压缩：按"短边"限制（1080p=短边1080、720p=短边720），保持宽高比，
+        // 宽高取偶（编码器要求）。无损组不受此设置影响（不走这里）
+        if (settings.shortEdge > 0) {
+            val short = minOf(targetW, targetH)
+            if (short > settings.shortEdge) {
+                val scale = settings.shortEdge.toFloat() / short
+                targetW = (targetW * scale).toInt() / 2 * 2
+                targetH = (targetH * scale).toInt() / 2 * 2
+            }
+        }
         val targetFps = target.fps.takeIf { it > 1f } ?: 30f
         val cacheDir = context.cacheDir
         val segments = mutableListOf<File>()
@@ -518,7 +618,10 @@ suspend fun transcodeConcat(
                 }
                 val hw = hwDecoderFor(infos[i].videoMime)
                 try {
-                    transcodeSegment(context, item, infos[i], targetW, targetH, targetFps, seg, hw, progress)
+                    transcodeSegment(
+                        context, item, infos[i], targetW, targetH, targetFps,
+                        codec, seg, hw, progress
+                    )
                 } catch (c: CancellationException) {
                     throw c
                 } catch (t: Throwable) {
@@ -529,25 +632,34 @@ suspend fun transcodeConcat(
                         "hw decode ($hw) failed for ${item.name}, falling back to software",
                         t
                     )
-                    transcodeSegment(context, item, infos[i], targetW, targetH, targetFps, seg, null, progress)
+                    transcodeSegment(
+                        context, item, infos[i], targetW, targetH, targetFps,
+                        codec, seg, null, progress
+                    )
                 }
             }
             val outTmp = File(cacheDir, uniqueTempName("转码成品", ".mp4"))
             try {
-                // 拼前参数集闸门（ROADMAP 预留）：各段 avcC 里的 SPS/PPS 字节一致才用
-                // mp4parser 追加；不一致退到 ffmpeg concat 重排——宁可多一步，不硬拼出解不动的流
-                val spsPps = segments.map { readAvcSpsPps(it) }
-                val uniformConfig = spsPps.all { it.isEmpty() } ||
-                    (spsPps.none { it.isEmpty() } && spsPps.all { listsEqual(it, spsPps.first()) })
-                if (uniformConfig) {
-                    val midItems = segments.map { VideoItem(Uri.fromFile(it), it.name, 0) }
-                    ParcelFileDescriptor.open(
-                        outTmp,
-                        ParcelFileDescriptor.MODE_READ_WRITE or
-                            ParcelFileDescriptor.MODE_CREATE or
-                            ParcelFileDescriptor.MODE_TRUNCATE
-                    ).use { pfd ->
-                        concatLossless(context, midItems, pfd)
+                // 拼前参数集闸门：H.264 输出走"各段 avcC 的 SPS/PPS 字节一致才用
+                // mp4parser 追加，不一致退 ffmpeg concat"；H.265/AV1 一律 ffmpeg
+                // concat——实测 mp4parser 克隆 hvc1 条目会丢 hvcC、写空 stss（成品
+                // 解不出画面），av01 采样条目更是解析直接抛异常，宁绕远路不硬拼
+                if (codec == "h264") {
+                    val paramSets = segments.map { readParameterSets(it) }
+                    val uniformConfig = paramSets.all { it.isEmpty() } ||
+                        (paramSets.none { it.isEmpty() } && paramSets.all { listsEqual(it, paramSets.first()) })
+                    if (uniformConfig) {
+                        val midItems = segments.map { VideoItem(Uri.fromFile(it), it.name, 0) }
+                        ParcelFileDescriptor.open(
+                            outTmp,
+                            ParcelFileDescriptor.MODE_READ_WRITE or
+                                ParcelFileDescriptor.MODE_CREATE or
+                                ParcelFileDescriptor.MODE_TRUNCATE
+                        ).use { pfd ->
+                            concatLossless(context, midItems, pfd)
+                        }
+                    } else {
+                        ffmpegConcatCopy(segments, outTmp)
                     }
                 } else {
                     ffmpegConcatCopy(segments, outTmp)
@@ -560,6 +672,7 @@ suspend fun transcodeConcat(
             verifyOutputUsable(context, outUri, expectedDurationMs)?.let { reason ->
                 throw IllegalStateException("自检未通过：$reason")
             }
+            return codec
         } finally {
             segments.forEach { runCatching { it.delete() } }
         }
@@ -679,6 +792,7 @@ private suspend fun transcodeSegment(
     targetW: Int,
     targetH: Int,
     targetFps: Float,
+    codec: String,
     out: File,
     hwDecoder: String?,
     onSegProgress: (Int) -> Unit
@@ -705,7 +819,7 @@ private suspend fun transcodeSegment(
     // -filter_threads 0 = 滤镜（scale/pad 的 swscale）按 CPU 数切片多线程，
     // 高分辨率源上缩放曾是最长的单线程段
     val decodeOpt = if (hwDecoder != null) "-c:v $hwDecoder " else ""
-    val cmd = "-y -filter_threads 0 ${decodeOpt}-i $input$audioIn -vf $vf $TRANSCODE_VIDEO $TRANSCODE_AUDIO -sn -dn '${out.absolutePath}'"
+    val cmd = "-y -filter_threads 0 ${decodeOpt}-i $input$audioIn -vf $vf ${transcodeVideoOpts(codec)} $TRANSCODE_AUDIO -sn -dn '${out.absolutePath}'"
     runFfmpeg(cmd, item.durationMs, onSegProgress)
 }
 
@@ -760,8 +874,9 @@ private suspend fun runFfmpeg(
     }
 }
 
-/** 读出视频轨 avcC 里的 SPS/PPS 字节，用于拼前参数集比对；无视频轨或无 avcC 返回空表 */
-private fun readAvcSpsPps(file: File): List<ByteArray> {
+/** 读出视频轨解码配置里的参数集字节（avcC 的 SPS/PPS，hvcC 的 VPS/SPS/PPS），
+ *  用于拼前参数集比对；无视频轨或读不到配置盒返回空表 */
+private fun readParameterSets(file: File): List<ByteArray> {
     FileInputStream(file).channel.use { ch ->
         val parser = boxParser ?: return emptyList()
         val iso = IsoFile(ch, parser)
@@ -770,11 +885,18 @@ private fun readAvcSpsPps(file: File): List<ByteArray> {
             val sampleEntry = trackBox.mediaBox.mediaInformationBox.sampleTableBox
                 .sampleDescriptionBox.getBoxes(VisualSampleEntry::class.java).firstOrNull()
                 ?: return emptyList()
-            val avcC = sampleEntry.getBoxes(AvcConfigurationBox::class.java).firstOrNull()
-                ?.avcDecoderConfigurationRecord ?: return emptyList()
-            return (avcC.sequenceParameterSets + avcC.pictureParameterSets).map { buf ->
-                val dup = buf.duplicate()
-                ByteArray(dup.remaining()).also { dup.get(it) }
+            sampleEntry.getBoxes(AvcConfigurationBox::class.java).firstOrNull()?.let { avcC ->
+                val rec = avcC.avcDecoderConfigurationRecord ?: return emptyList()
+                return (rec.sequenceParameterSets + rec.pictureParameterSets).map { buf ->
+                    val dup = buf.duplicate()
+                    ByteArray(dup.remaining()).also { dup.get(it) }
+                }
+            }
+            sampleEntry.getBoxes(HevcConfigurationBox::class.java).firstOrNull()?.let { hvcC ->
+                // nal_unit_type：32=VPS 33=SPS 34=PPS
+                return hvcC.hevcDecoderConfigurationRecord.arrays
+                    .filter { it.nal_unit_type in 32..34 }
+                    .flatMap { it.nalUnits }
             }
         }
     }

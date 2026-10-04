@@ -7,6 +7,15 @@
     android:paddingTop="5dp"
     android:paddingBottom="5dp">
 
+    <!-- 拖动手柄：长按拖动调整顺序 -->
+    <ImageView
+        android:id="@+id/ivDragHandle"
+        android:layout_width="32dp"
+        android:layout_height="48dp"
+        android:contentDescription="拖动调整顺序"
+        android:scaleType="center"
+        android:src="@drawable/ic_drag_handle" />
+
     <ImageView
         android:id="@+id/ivThumb"
         android:layout_width="76dp"
@@ -37,24 +46,6 @@
             android:textColor="@color/text_secondary"
             android:textSize="11sp" />
     </LinearLayout>
-
-    <Button
-        android:id="@+id/btnUp"
-        style="@style/Widget.Material3.Button.TextButton"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:minWidth="0dp"
-        android:text="↑"
-        android:textColor="@color/text_secondary" />
-
-    <Button
-        android:id="@+id/btnDown"
-        style="@style/Widget.Material3.Button.TextButton"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:minWidth="0dp"
-        android:text="↓"
-        android:textColor="@color/text_secondary" />
 
     <Button
         android:id="@+id/btnRemove"

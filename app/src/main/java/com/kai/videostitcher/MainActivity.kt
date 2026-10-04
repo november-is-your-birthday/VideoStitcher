@@ -13,6 +13,7 @@ import android.os.Environment
 import android.os.StatFs
 import android.text.Editable
 import android.text.TextWatcher
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -20,6 +21,7 @@ import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.IntentSenderRequest
@@ -29,7 +31,6 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
-import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -99,13 +100,13 @@ class MainActivity : AppCompatActivity() {
         }
 
     private lateinit var containerGroups: LinearLayout
+    private lateinit var scrollGroups: ScrollView
     private lateinit var tvEmpty: TextView
     private lateinit var tvStatus: TextView
     private lateinit var pbOverall: ProgressBar
     private lateinit var btnStart: Button
     private lateinit var btnOpenOutput: Button
     private lateinit var btnNewGroup: Button
-    private lateinit var btnImportFolders: Button
 
     private val pickVideos =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -131,10 +132,6 @@ class MainActivity : AppCompatActivity() {
                 if (uris.isEmpty()) data.data?.let { uris.add(it) }
                 if (uris.isNotEmpty()) addGroupFromPicker(uris)
             }
-        }
-    private val pickTree =
-        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-            if (uri != null) importFromFolder(uri)
         }
     private val albumPick =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
@@ -173,19 +170,16 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         containerGroups = findViewById(R.id.containerGroups)
+        scrollGroups = findViewById(R.id.scrollGroups)
         tvEmpty = findViewById(R.id.tvEmpty)
         tvStatus = findViewById(R.id.tvStatus)
         pbOverall = findViewById(R.id.pbOverall)
         btnStart = findViewById(R.id.btnStart)
         btnOpenOutput = findViewById(R.id.btnOpenOutput)
         btnNewGroup = findViewById(R.id.btnNewGroup)
-        btnImportFolders = findViewById(R.id.btnImportFolders)
 
         btnNewGroup.setOnClickListener {
             if (!merging) pickVideos.launch(arrayOf("video/*"))
-        }
-        btnImportFolders.setOnClickListener {
-            if (!merging) pickTree.launch(null)
         }
         findViewById<Button>(R.id.btnAlbumPick).setOnClickListener {
             // "从相册选"走系统照片选择器（与其它应用的体验一致）；
@@ -194,6 +188,8 @@ class MainActivity : AppCompatActivity() {
         }
         btnStart.setOnClickListener { if (merging) stopMerging() else onStartClicked() }
         btnOpenOutput.setOnClickListener { openLastOutput() }
+        findViewById<TextView>(R.id.btnOutputSettings).setOnClickListener { showOutputSettingsDialog() }
+        refreshOutputSettingsLabel()
 
         groups.addAll(Store.load(this))
         render()
@@ -254,37 +250,6 @@ class MainActivity : AppCompatActivity() {
         groups.add(group)
         render()
         fillDurationsAsync(group)
-    }
-
-    private fun importFromFolder(treeUri: Uri) {
-        runCatching {
-            contentResolver.takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        val root = DocumentFile.fromTreeUri(this, treeUri)
-        if (root == null) {
-            toast("无法读取该文件夹")
-            return
-        }
-        val imported = mutableListOf<Group>()
-        for (dir in root.listFiles().filter { it.isDirectory }) {
-            val files = dir.listFiles()
-                .filter { it.isFile && isVideoName(it.name ?: "") }
-                .sortedWith { a, b -> naturalCompare(a.name ?: "", b.name ?: "") }
-            if (files.isEmpty()) continue
-            imported.add(
-                Group(
-                    dir.name ?: "分组",
-                    files.map { VideoItem(it.uri, it.name ?: "", 0) }.toMutableList()
-                )
-            )
-        }
-        if (imported.isEmpty()) {
-            toast("这个文件夹下没有找到包含视频的子文件夹")
-            return
-        }
-        groups.addAll(imported)
-        render()
-        imported.forEach { fillDurationsAsync(it) }
     }
 
     private fun fillDurationsAsync(group: Group) {
@@ -372,29 +337,37 @@ class MainActivity : AppCompatActivity() {
                 listOf(formatDuration(item.durationMs), item.codec).filter { it.isNotEmpty() }
                     .joinToString(" · ")
             fileDurationViews.add(row.findViewById(R.id.tvFileDuration))
-            val up = row.findViewById<Button>(R.id.btnUp)
-            val down = row.findViewById<Button>(R.id.btnDown)
-            up.isEnabled = index > 0
-            down.isEnabled = index < group.items.size - 1
-            up.setOnClickListener {
-                if (merging) return@setOnClickListener
-                Collections.swap(group.items, index, index - 1)
-                // 内容变了，已拼接状态失效：按钮退回灰色
-                group.mergedOk = false
-                render()
-            }
-            down.setOnClickListener {
-                if (merging) return@setOnClickListener
-                Collections.swap(group.items, index, index + 1)
-                group.mergedOk = false
-                render()
-            }
             row.findViewById<Button>(R.id.btnRemove).setOnClickListener {
                 if (merging) return@setOnClickListener
                 group.items.removeAt(index)
                 group.mergedOk = false
                 if (group.items.isEmpty()) groups.remove(group)
                 render()
+            }
+            // 拖动"≡"手柄调整顺序（替代旧 ↑↓ 按钮）
+            row.findViewById<ImageView>(R.id.ivDragHandle).setOnTouchListener { v, ev ->
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        if (merging || dragSort != null) return@setOnTouchListener false
+                        v.parent?.requestDisallowInterceptTouchEvent(true)
+                        dragSort = DragSort(group, llFiles, index).apply {
+                            grabOffset = ev.rawY - (contentTop() + index * rowH)
+                            update(ev.rawY)
+                        }
+                        scrollGroups.postDelayed(dragScrollTick, 24)
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        dragSort?.update(ev.rawY)
+                        true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        scrollGroups.removeCallbacks(dragScrollTick)
+                        dragSort?.finish(commit = ev.actionMasked == MotionEvent.ACTION_UP)
+                        true
+                    }
+                    else -> false
+                }
             }
             llFiles.addView(row)
         }
@@ -414,6 +387,98 @@ class MainActivity : AppCompatActivity() {
 
         cardViews[group] = CardViews(pbGroup, tvStatusGroup, tvInfo, fileDurationViews, btnDeleteSources)
         return card
+    }
+
+    // ---- 组内视频拖拽排序 ----
+    private var dragSort: DragSort? = null
+    private val dragScrollTick = object : Runnable {
+        override fun run() {
+            val st = dragSort ?: return
+            st.autoScrollStep()
+            scrollGroups.postDelayed(this, 24)
+        }
+    }
+
+    /** 一次拖拽手势的状态：行平移贴指 + 与相邻行交叉即换位 + 贴边自动滚动 */
+    private inner class DragSort(
+        private val group: Group,
+        private val llFiles: LinearLayout,
+        private val startIndex: Int
+    ) {
+        private val rows = (0 until llFiles.childCount).map { llFiles.getChildAt(it) }
+        val dragView = rows[startIndex]
+        val rowH = dragView.height.coerceAtLeast(1)
+        private val loc = IntArray(2)
+        var grabOffset = 0f
+        var lastRawY = 0f
+        private var targetIndex = startIndex
+
+        init {
+            dragView.elevation = 12f
+            dragView.alpha = 0.95f
+        }
+
+        fun contentTop(): Float {
+            llFiles.getLocationOnScreen(loc)
+            return loc[1].toFloat()
+        }
+
+        fun update(rawY: Float) {
+            lastRawY = rawY
+            // 行平移量 = 手指内容坐标 - 握点偏移 - 行原位（钳制在列表范围内）
+            val ty = (rawY - contentTop() - grabOffset - startIndex * rowH)
+                .coerceIn(0f, ((rows.size - 1) * rowH).toFloat())
+            dragView.translationY = ty
+            val tgt = (ty / rowH).toInt().coerceIn(0, rows.size - 1)
+            if (tgt != targetIndex) {
+                targetIndex = tgt
+                shiftOthers()
+            }
+        }
+
+        /** 被跨过的行让位（视觉平移一行高），松手前不重绑视图，触摸流不中断 */
+        private fun shiftOthers() {
+            rows.forEachIndexed { i, v ->
+                if (v === dragView) return@forEachIndexed
+                v.translationY = when {
+                    startIndex < targetIndex && i in (startIndex + 1)..targetIndex -> -rowH.toFloat()
+                    startIndex > targetIndex && i in targetIndex until startIndex -> rowH.toFloat()
+                    else -> 0f
+                }
+            }
+        }
+
+        /** 指尖贴近屏幕上下边缘时自动滚动列表（滚动会改变内容坐标，重新贴指） */
+        fun autoScrollStep() {
+            val screenH = resources.displayMetrics.heightPixels
+            val dy = when {
+                lastRawY < 140f -> -30
+                lastRawY > screenH - 140f -> 30
+                else -> 0
+            }
+            if (dy != 0) {
+                scrollGroups.smoothScrollBy(0, dy)
+                update(lastRawY)
+            }
+        }
+
+        /** 松手落位：数据真正移动 + 状态失效 + 存盘 + 重绑；未换位只复位视觉 */
+        fun finish(commit: Boolean) {
+            val tgt = targetIndex
+            rows.forEach {
+                it.translationY = 0f
+                it.elevation = 0f
+                it.alpha = 1f
+            }
+            dragSort = null
+            if (!commit || tgt == startIndex) return
+            val item = group.items.removeAt(startIndex)
+            group.items.add(tgt, item)
+            // 顺序变了：已拼接状态失效（红色删源按钮退回灰色）+ 落盘 + 重绑序号
+            group.mergedOk = false
+            Store.save(this@MainActivity, groups)
+            render()
+        }
     }
 
     private fun onStartClicked() {
@@ -477,6 +542,82 @@ class MainActivity : AppCompatActivity() {
                 throw c
             }
         }
+    }
+
+    /** 输出设置摘要标签：原尺寸 · 自动 / 720p · H.265 … */
+    private fun refreshOutputSettingsLabel() {
+        val s = loadTranscodeSettings(this)
+        val res = when (s.shortEdge) { 1080 -> "1080p"; 720 -> "720p"; else -> "原尺寸" }
+        val codec = when (s.codecMode) {
+            "h265" -> "H.265"; "av1" -> "AV1"; "h264" -> "H.264"; else -> "自动跟随源"
+        }
+        findViewById<TextView>(R.id.btnOutputSettings).text = "输出设置：$res · $codec（仅转码组生效）"
+    }
+
+    /** 输出设置对话框：分辨率压缩 + 编码格式。只影响需要转码的分组 */
+    private fun showOutputSettingsDialog() {
+        val cur = loadTranscodeSettings(this)
+        val resNames = arrayOf("保持原尺寸（默认）", "压缩到 1080p", "压缩到 720p（最小体积）")
+        val resValues = intArrayOf(0, 1080, 720)
+        val av1Ok = av1EncodeAvailable()
+        val codecNames = arrayOf(
+            "自动（跟随源视频编码，混合时少数服从多数）",
+            "H.264（推荐：兼容性最好）",
+            "H.265（体积约省 30-50%，转码更慢，老设备可能不支持）",
+            if (av1Ok) "AV1（体积最小，播放兼容性较弱）"
+            else "AV1（本机编码组件不支持，选了也会回退 H.264）"
+        )
+        val codecValues = arrayOf("auto", "h264", "h265", "av1")
+        val checkedRes = resValues.indexOf(cur.shortEdge).coerceAtLeast(0)
+        val checkedCodec = codecValues.indexOf(cur.codecMode).coerceAtLeast(0)
+        var selRes = cur.shortEdge
+        var selCodec = cur.codecMode
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 0)
+        }
+        fun sectionLabel(text: String, topPad: Int = 0) = TextView(this).apply {
+            this.text = text
+            textSize = 12f
+            setTextColor(Color.parseColor("#A3A3B8"))
+            setPadding(0, topPad, 0, 0)
+        }
+        fun radioGroup(names: Array<String>, checkedIndex: Int, onPick: (Int) -> Unit) =
+            android.widget.RadioGroup(this).apply {
+                names.forEachIndexed { i, name ->
+                    addView(android.widget.RadioButton(context).apply {
+                        text = name
+                        textSize = 14f
+                        id = i
+                    })
+                }
+                check(checkedIndex)
+                setOnCheckedChangeListener { _, checkedId -> onPick(checkedId) }
+            }
+
+        container.addView(sectionLabel("输出分辨率（短边限制）"))
+        container.addView(radioGroup(resNames, checkedRes) { i -> selRes = resValues[i] })
+        container.addView(sectionLabel("输出编码", 24))
+        container.addView(radioGroup(codecNames, checkedCodec) { i -> selCodec = codecValues[i] })
+        container.addView(TextView(this).apply {
+            text = "仅对参数不一致、需要转码的分组生效；无损拼接的分组永远保持原画质不变。" +
+                "自动模式下编码不统一的分组按数量最多者输出（平票取 H.264）。"
+            textSize = 12f
+            setTextColor(Color.parseColor("#A3A3B8"))
+            setPadding(0, 24, 0, 0)
+        })
+
+        AlertDialog.Builder(this)
+            .setTitle("输出设置")
+            .setView(container)
+            .setPositiveButton("保存") { _, _ ->
+                saveTranscodeSettings(this, TranscodeSettings(selRes, selCodec))
+                refreshOutputSettingsLabel()
+                toast("输出设置已保存")
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     /** 用户点击"停止拼接"：先弹窗确认防误触，确认后取消整轮拼接，半成品由取消链路自动清理 */
@@ -813,10 +954,11 @@ class MainActivity : AppCompatActivity() {
                 checkInternalDiskSpace(group)
                 setGroupState(group, "自动转码拼接中…（较慢，约为视频时长）", null)
                 try {
-                    transcodeConcat(this@MainActivity, items, infos, outUri) { msg ->
+                    val codec = transcodeConcat(this@MainActivity, items, infos, outUri) { msg ->
                         setGroupState(group, msg, null)
                     }
-                    setGroupState(group, "✓ 完成（转码拼接，已统一为 H.264+AAC）", 100)
+                    val codecName = when (codec) { "h265" -> "H.265"; "av1" -> "AV1"; else -> "H.264" }
+                    setGroupState(group, "✓ 完成（转码拼接，已统一为 $codecName+AAC）", 100)
                     return outUri
                 } catch (c: CancellationException) {
                     throw c
@@ -925,7 +1067,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun setUiEnabled(enabled: Boolean) {
         btnNewGroup.isEnabled = enabled
-        btnImportFolders.isEnabled = enabled
         btnStart.isEnabled = enabled
         fun walk(v: View) {
             if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
