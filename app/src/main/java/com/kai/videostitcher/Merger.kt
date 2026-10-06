@@ -27,7 +27,10 @@ import com.arthenica.ffmpegkit.Statistics
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -50,6 +53,7 @@ import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 /** 全局导出闸门：Transformer 导出（转封装）最多 2 路并发，匹配手机硬件编码器实例数；
  *  mp4parser 无损拼接只吃 IO，不占闸门，可任意并行。 */
@@ -515,7 +519,7 @@ fun av1EncodeAvailable(): Boolean =
 /**
  * 转码输出设置（仅转码组生效，无损路径不重编码不受影响）。
  * shortEdge：输出短边上限（0=保持原尺寸；1080/720=把超过限制的源缩到该短边）。
- * codecMode："auto"=跟随组内源编码（混合时少数服从多数，平票取 H.264），
+ * codecMode："auto"=跟随组内源编码（混合时按总时长最多者，平票取 H.264），
  * 或固定 "h264"/"h265"/"av1"。
  */
 data class TranscodeSettings(val shortEdge: Int, val codecMode: String)
@@ -548,13 +552,22 @@ private fun outputCodecOf(mime: String?): String = when (mime) {
     else -> "h264"
 }
 
-/** "auto" 模式解析组内实际输出编码：少数服从多数；平票取更低世代
- *  （H.264 低于 H.265 低于 AV1——老设备兼容面大、软解省电），即 h264 > h265 > av1 */
-fun resolveOutputCodec(infos: List<TrackInfo>, settings: TranscodeSettings): String {
+/** "auto" 模式解析组内实际输出编码：按总时长少数服从多数——哪种编码的素材
+ *  总时长最长就输出谁（个数多但都是几秒的零碎小片段不再带偏输出）；平票取
+ *  更低世代（H.264 低于 H.265 低于 AV1——老设备兼容面大、软解省电） */
+fun resolveOutputCodec(
+    infos: List<TrackInfo>,
+    durationsMs: List<Long>,
+    settings: TranscodeSettings
+): String {
     if (settings.codecMode != "auto") return settings.codecMode
-    val counts = infos.groupingBy { outputCodecOf(it.videoMime) }.eachCount()
-    val max = counts.values.maxOrNull() ?: return "h264"
-    val winners = counts.filterValues { it == max }.keys
+    val totals = HashMap<String, Long>()
+    infos.forEachIndexed { i, info ->
+        val codec = outputCodecOf(info.videoMime)
+        totals[codec] = (totals[codec] ?: 0L) + durationsMs.getOrElse(i) { 0L }
+    }
+    val max = totals.values.maxOrNull() ?: return "h264"
+    val winners = totals.filterValues { it == max }.keys
     return when {
         "h264" in winners -> "h264"
         "h265" in winners -> "h265"
@@ -591,7 +604,8 @@ suspend fun transcodeConcat(
 ): String {
     exportGate.withPermit {
         val settings = loadTranscodeSettings(context)
-        val codec = resolveOutputCodec(infos, settings)
+        // 时长在拼前已逐项补探过（mergeGroup），这里直接按素材时长加权选编码
+        val codec = resolveOutputCodec(infos, items.map { it.durationMs }, settings)
         val target = infos.first()
         var targetW = target.width.takeIf { it > 0 } ?: 1920
         var targetH = target.height.takeIf { it > 0 } ?: 1080
@@ -626,12 +640,14 @@ suspend fun transcodeConcat(
                     throw c
                 } catch (t: Throwable) {
                     if (hw == null) throw t
-                    // 硬解不可用（机型不支持该编码/内容特殊/解码器会话紧张）：退软解重跑
+                    // 硬解不可用（机型不支持该编码/内容特殊/会话紧张/被进度看门狗
+                    // 掐掉）：退软解重跑，个别 AV1 流卡死硬解就靠这一步救回来
                     android.util.Log.w(
                         "VideoStitcher",
                         "hw decode ($hw) failed for ${item.name}, falling back to software",
                         t
                     )
+                    onProgress("自动转码中 第 ${i + 1}/${items.size} 段（硬解无响应/失败，改用软解重试）…")
                     transcodeSegment(
                         context, item, infos[i], targetW, targetH, targetFps,
                         codec, seg, null, progress
@@ -719,14 +735,14 @@ suspend fun videoCopyConcatAudio(
                 val input = FFmpegKitConfig.getSafParameterForRead(context, item.uri)
                 if (infos[i].hasAudio) {
                     // 只重编音频（-vn 跳过视频解码），秒级完成
-                    runFfmpeg("-y -i $input -vn $TRANSCODE_AUDIO '${af.absolutePath}'", 0) {}
+                    runFfmpeg("-y -i $input -vn $TRANSCODE_AUDIO '${af.absolutePath}'", 0, {})
                 } else {
                     // 无声段生成等长静音轨，保证成品音轨连续
                     val secs = trimFps((if (item.durationMs > 0) item.durationMs else 1000L) / 1000f)
                     runFfmpeg(
                         "-y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t $secs $TRANSCODE_AUDIO '${af.absolutePath}'",
-                        0
-                    ) {}
+                        0, {}
+                    )
                 }
             }
             onProgress("视频无损拼接中…")
@@ -774,8 +790,8 @@ suspend fun stripForeignTracks(context: Context, uri: Uri, out: File): Boolean {
     val input = FFmpegKitConfig.getSafParameterForRead(context, uri)
     return try {
         runFfmpeg(
-            "-y -i $input -map 0:v -map 0:a? -c copy '${out.absolutePath}'", 0
-        ) {}
+            "-y -i $input -map 0:v -map 0:a? -c copy '${out.absolutePath}'", 0, {}
+        )
         true
     } catch (c: CancellationException) {
         throw c
@@ -831,46 +847,87 @@ private suspend fun ffmpegConcatCopy(segments: List<File>, out: File) {
         )
         runFfmpeg(
             "-y -f concat -safe 0 -i '${list.absolutePath}' -c copy -movflags +faststart '${out.absolutePath}'",
-            0
-        ) {}
+            0, {}
+        )
     } finally {
         list.delete()
     }
 }
 
-/** 同步等待一场 ffmpeg 执行；durationMs>0 时按已处理时长回报百分比进度 */
+/**
+ * 同步等待一场 ffmpeg 执行；durationMs>0 时按已处理时长回报百分比进度。
+ * 进度看门狗：统计回调里的"已处理媒体时间"超过 stallTimeoutMs 毫秒不前进就强制
+ * 结束本场会话并报错——个别 AV1 等特殊流会把硬件解码器卡死，ffmpeg 永远等不到
+ * 第一帧，没有看门狗就表现为进度条 0% 且永不结束、也不报错。正常编码/拷贝的
+ * 统计持续前进不会误伤；-movflags faststart 的二次搬运阶段本就无统计，超时值
+ * 给足了余量。
+ */
 private suspend fun runFfmpeg(
     command: String,
     durationMs: Long,
-    onProgress: (Int) -> Unit
+    onProgress: (Int) -> Unit,
+    stallTimeoutMs: Long = 180_000L
 ): Unit = withContext(Dispatchers.IO) {
-    val finished = CompletableDeferred<FFmpegSession>()
-    val session = FFmpegKit.executeAsync(
-        command,
-        { s -> finished.complete(s) },
-        null,
-        { stats ->
-            if (durationMs > 0) {
-                onProgress((stats.time * 100L / durationMs).toInt().coerceIn(0, 99))
+    coroutineScope {
+        val finished = CompletableDeferred<FFmpegSession>()
+        // 统计回调在 ffmpegkit 的线程、看门狗轮询在协程线程：基准值用原子量传递。
+        // lastMediaTimeBits 存已处理媒体时间的原始位型，位型变了才算"有进展"，
+        // 反复回调同一个卡死的时间点不会不断重置看门狗
+        val lastMediaTimeBits = AtomicLong(Double.NaN.toRawBits())
+        val lastAdvanceMs = AtomicLong(System.currentTimeMillis())
+        val session = FFmpegKit.executeAsync(
+            command,
+            { s -> finished.complete(s) },
+            null,
+            { stats ->
+                val bits = stats.time.toRawBits()
+                if (lastMediaTimeBits.getAndSet(bits) != bits) {
+                    lastAdvanceMs.set(System.currentTimeMillis())
+                }
+                if (durationMs > 0) {
+                    onProgress((stats.time * 100L / durationMs).toInt().coerceIn(0, 99))
+                }
+            }
+        )
+        val watchdog = launch {
+            while (isActive && !finished.isCompleted) {
+                delay(5_000)
+                if (finished.isCompleted) break
+                if (System.currentTimeMillis() - lastAdvanceMs.get() > stallTimeoutMs) {
+                    android.util.Log.e(
+                        "VideoStitcher",
+                        "ffmpeg 看门狗：${stallTimeoutMs / 1000} 秒无进展，已中止。cmd: $command"
+                    )
+                    runCatching { FFmpegKit.cancel(session.sessionId) }
+                    finished.completeExceptionally(
+                        IllegalStateException(
+                            "ffmpeg 已 ${stallTimeoutMs / 1000} 秒无进展" +
+                                "（该视频流疑似卡死了本机解码器），已自动中止"
+                        )
+                    )
+                    break
+                }
             }
         }
-    )
-    try {
-        val s = finished.await()
-        if (!ReturnCode.isSuccess(s.returnCode)) {
-            val tail = runCatching { s.allLogsAsString.takeLast(300) }.getOrDefault("")
-            // 完整命令 + 完整日志进 logcat：失败诊断需要首行报错，300 字符尾部只有统计行
-            android.util.Log.e("VideoStitcher", "ffmpeg 失败 cmd: $command")
-            runCatching { s.allLogsAsString }.getOrNull()?.let {
-                android.util.Log.e("VideoStitcher", "ffmpeg 完整日志: ${it.takeLast(4000)}")
+        try {
+            val s = finished.await()
+            if (!ReturnCode.isSuccess(s.returnCode)) {
+                val tail = runCatching { s.allLogsAsString.takeLast(300) }.getOrDefault("")
+                // 完整命令 + 完整日志进 logcat：失败诊断需要首行报错，300 字符尾部只有统计行
+                android.util.Log.e("VideoStitcher", "ffmpeg 失败 cmd: $command")
+                runCatching { s.allLogsAsString }.getOrNull()?.let {
+                    android.util.Log.e("VideoStitcher", "ffmpeg 完整日志: ${it.takeLast(4000)}")
+                }
+                throw IllegalStateException("ffmpeg 失败（returnCode=${s.returnCode}）$tail")
             }
-            throw IllegalStateException("ffmpeg 失败（returnCode=${s.returnCode}）$tail")
+        } catch (e: CancellationException) {
+            // Activity 销毁会取消协程：只取消自己这场会话。FFmpegKit.cancel() 无参重载
+            // 是全局的，会把同时段其它分组并行转码一起掐掉
+            runCatching { FFmpegKit.cancel(session.sessionId) }
+            throw e
+        } finally {
+            watchdog.cancel()
         }
-    } catch (e: CancellationException) {
-        // Activity 销毁会取消协程：只取消自己这场会话。FFmpegKit.cancel() 无参重载
-        // 是全局的，会把同时段其它分组并行转码一起掐掉
-        runCatching { FFmpegKit.cancel(session.sessionId) }
-        throw e
     }
 }
 
@@ -940,14 +997,36 @@ private suspend fun exportComposition(
         }
 
         val holder = ProgressHolder()
-        while (!finished.isCompleted) {
-            withContext(Dispatchers.Main) {
-                runCatching { transformer.getProgress(holder) }
+        var lastProgress = -1
+        var lastChangeMs = System.currentTimeMillis()
+        try {
+            while (!finished.isCompleted) {
+                withContext(Dispatchers.Main) {
+                    runCatching { transformer.getProgress(holder) }
+                }
+                if (holder.progress != lastProgress) {
+                    lastProgress = holder.progress
+                    lastChangeMs = System.currentTimeMillis()
+                }
+                if (holder.progress in 1..99) onProgress(holder.progress)
+                // 看门狗：进度长时间不动（个别 AV1/特殊流卡死解码管线，media3 自带的
+                // muxer 停顿超时盖不住所有情况）时主动取消，上层引擎链降级下一档方式，
+                // 而不是进度 0% 永远挂起
+                if (System.currentTimeMillis() - lastChangeMs > 180_000L) {
+                    throw IllegalStateException(
+                        "转封装已 180 秒无进展（该视频流疑似卡死了本机解码管线），已自动中止"
+                    )
+                }
+                delay(300)
             }
-            if (holder.progress in 1..99) onProgress(holder.progress)
-            delay(300)
+            finished.await()
+        } catch (e: CancellationException) {
+            withContext(Dispatchers.Main) { runCatching { transformer.cancel() } }
+            throw e
+        } catch (t: Throwable) {
+            withContext(Dispatchers.Main) { runCatching { transformer.cancel() } }
+            throw t
         }
-        finished.await()
     }
 }
 

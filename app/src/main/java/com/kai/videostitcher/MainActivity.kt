@@ -12,7 +12,6 @@ import android.os.Environment
 import android.os.StatFs
 import android.text.Editable
 import android.text.TextWatcher
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -463,30 +462,23 @@ class MainActivity : AppCompatActivity() {
                 if (group.items.isEmpty()) groups.remove(group)
                 render()
             }
-            // 拖动"≡"手柄调整顺序（替代旧 ↑↓ 按钮）
-            row.findViewById<ImageView>(R.id.ivDragHandle).setOnTouchListener { v, ev ->
-                when (ev.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> {
-                        if (merging || dragSort != null) return@setOnTouchListener false
-                        v.parent?.requestDisallowInterceptTouchEvent(true)
-                        dragSort = DragSort(group, llFiles, index).apply {
-                            grabOffset = ev.rawY - (contentTop() + index * rowH)
-                            update(ev.rawY)
-                        }
-                        scrollGroups.postDelayed(dragScrollTick, 24)
-                        true
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        dragSort?.update(ev.rawY)
-                        true
-                    }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        scrollGroups.removeCallbacks(dragScrollTick)
-                        dragSort?.finish(commit = ev.actionMasked == MotionEvent.ACTION_UP)
-                        true
-                    }
-                    else -> false
-                }
+            // ↑↓ 调整顺序（1.9.1 起恢复按钮排序，替代 1.7.0 的长按拖动手柄）
+            val up = row.findViewById<Button>(R.id.btnUp)
+            val down = row.findViewById<Button>(R.id.btnDown)
+            up.isEnabled = index > 0
+            down.isEnabled = index < group.items.size - 1
+            up.setOnClickListener {
+                if (merging) return@setOnClickListener
+                Collections.swap(group.items, index, index - 1)
+                // 顺序变了：已拼接状态失效（红色删源按钮退回灰色）
+                group.mergedOk = false
+                render()
+            }
+            down.setOnClickListener {
+                if (merging) return@setOnClickListener
+                Collections.swap(group.items, index, index + 1)
+                group.mergedOk = false
+                render()
             }
             llFiles.addView(row)
         }
@@ -506,98 +498,6 @@ class MainActivity : AppCompatActivity() {
 
         cardViews[group] = CardViews(pbGroup, tvStatusGroup, tvInfo, fileDurationViews, btnDeleteSources)
         return card
-    }
-
-    // ---- 组内视频拖拽排序 ----
-    private var dragSort: DragSort? = null
-    private val dragScrollTick = object : Runnable {
-        override fun run() {
-            val st = dragSort ?: return
-            st.autoScrollStep()
-            scrollGroups.postDelayed(this, 24)
-        }
-    }
-
-    /** 一次拖拽手势的状态：行平移贴指 + 与相邻行交叉即换位 + 贴边自动滚动 */
-    private inner class DragSort(
-        private val group: Group,
-        private val llFiles: LinearLayout,
-        private val startIndex: Int
-    ) {
-        private val rows = (0 until llFiles.childCount).map { llFiles.getChildAt(it) }
-        val dragView = rows[startIndex]
-        val rowH = dragView.height.coerceAtLeast(1)
-        private val loc = IntArray(2)
-        var grabOffset = 0f
-        var lastRawY = 0f
-        private var targetIndex = startIndex
-
-        init {
-            dragView.elevation = 12f
-            dragView.alpha = 0.95f
-        }
-
-        fun contentTop(): Float {
-            llFiles.getLocationOnScreen(loc)
-            return loc[1].toFloat()
-        }
-
-        fun update(rawY: Float) {
-            lastRawY = rawY
-            // 行平移量 = 手指内容坐标 - 握点偏移 - 行原位（钳制在列表范围内）
-            val ty = (rawY - contentTop() - grabOffset - startIndex * rowH)
-                .coerceIn(0f, ((rows.size - 1) * rowH).toFloat())
-            dragView.translationY = ty
-            val tgt = (ty / rowH).toInt().coerceIn(0, rows.size - 1)
-            if (tgt != targetIndex) {
-                targetIndex = tgt
-                shiftOthers()
-            }
-        }
-
-        /** 被跨过的行让位（视觉平移一行高），松手前不重绑视图，触摸流不中断 */
-        private fun shiftOthers() {
-            rows.forEachIndexed { i, v ->
-                if (v === dragView) return@forEachIndexed
-                v.translationY = when {
-                    startIndex < targetIndex && i in (startIndex + 1)..targetIndex -> -rowH.toFloat()
-                    startIndex > targetIndex && i in targetIndex until startIndex -> rowH.toFloat()
-                    else -> 0f
-                }
-            }
-        }
-
-        /** 指尖贴近屏幕上下边缘时自动滚动列表（滚动会改变内容坐标，重新贴指） */
-        fun autoScrollStep() {
-            val screenH = resources.displayMetrics.heightPixels
-            val dy = when {
-                lastRawY < 140f -> -30
-                lastRawY > screenH - 140f -> 30
-                else -> 0
-            }
-            if (dy != 0) {
-                scrollGroups.smoothScrollBy(0, dy)
-                update(lastRawY)
-            }
-        }
-
-        /** 松手落位：数据真正移动 + 状态失效 + 存盘 + 重绑；未换位只复位视觉 */
-        fun finish(commit: Boolean) {
-            val tgt = targetIndex
-            rows.forEach {
-                it.translationY = 0f
-                it.elevation = 0f
-                it.alpha = 1f
-            }
-            dragSort = null
-            if (!commit || tgt == startIndex) return
-            val item = group.items.removeAt(startIndex)
-            group.items.add(tgt, item)
-            // 顺序变了：已拼接状态失效（红色删源按钮退回灰色）+ 落盘 + 重绑序号
-            group.mergedOk = false
-            Store.save(this@MainActivity, groups)
-            render()
-        }
     }
 
     private fun onStartClicked() {
@@ -692,7 +592,7 @@ class MainActivity : AppCompatActivity() {
         val resValues = intArrayOf(0, 1080, 720)
         val av1Ok = av1EncodeAvailable()
         val codecNames = arrayOf(
-            "自动（跟随源视频编码，混合时少数服从多数）",
+            "自动（跟随源视频编码，混合时按总时长最多者）",
             "H.264（推荐：兼容性最好）",
             "H.265（体积约省 30-50%，转码更慢，老设备可能不支持）",
             if (av1Ok) "AV1（体积最小，播放兼容性较弱）"
@@ -733,7 +633,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(radioGroup(codecNames, checkedCodec) { i -> selCodec = codecValues[i] })
         container.addView(TextView(this).apply {
             text = "仅对参数不一致、需要转码的分组生效；无损拼接的分组永远保持原画质不变。" +
-                "自动模式下编码不统一的分组按数量最多者输出（平票取 H.264）。"
+                "自动模式下编码不统一的分组按总时长最多的编码输出（平票取 H.264）。"
             textSize = 12f
             setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
             setPadding(0, 24, 0, 0)

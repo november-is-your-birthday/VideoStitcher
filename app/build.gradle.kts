@@ -12,8 +12,8 @@ android {
         applicationId = "com.kai.videostitcher"
         minSdk = 24
         targetSdk = 36
-        versionCode = 20
-        versionName = "1.9.0"
+        versionCode = 21
+        versionName = "1.9.1"
     }
 
     buildTypes {
@@ -62,4 +62,6 @@ dependencies {
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full-gpl:8.1.7")
     // ffmpeg-kit 的运行时依赖，fork 的 POM 没带，必须手动声明（缺了会 NoClassDefFoundError）
     implementation("com.arthenica:smart-exception-java:0.2.0")
+
+    testImplementation("junit:junit:4.13.2")
 }
