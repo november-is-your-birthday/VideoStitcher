@@ -8,6 +8,11 @@
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+    <!-- 拼接前台服务：切后台/页面回收时保活。dataSync 全版本通用（14/15 的 6 小时
+         时限对视频拼接绰绰有余）；mediaProcessing 在部分 15 系统上类型校验有误报 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="true"
@@ -30,6 +35,11 @@
             android:name=".AlbumPickerActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:exported="false" />
+
+        <service
+            android:name=".MergeService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>
