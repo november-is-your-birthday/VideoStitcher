@@ -693,7 +693,8 @@ class MainActivity : AppCompatActivity() {
         container.addView(radioGroup(codecNames, checkedCodec) { i -> selCodec = codecValues[i] })
         container.addView(TextView(this).apply {
             text = "仅对参数不一致、需要转码的分组生效；无损拼接的分组永远保持原画质不变。" +
-                "自动模式下编码不统一的分组按总时长最多的编码输出（平票取 H.264）。"
+                "自动模式下编码不统一的分组按总时长最多的编码输出（平票取 H.264），" +
+                "且只转码编码不同的段，其余段原样拷贝。"
             textSize = 12f
             setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
             setPadding(0, 24, 0, 0)
@@ -986,6 +987,34 @@ class MainActivity : AppCompatActivity() {
                 } catch (t: Throwable) {
                     android.util.Log.e(TAG, "video-copy concat failed", t)
                     setGroupState(group, "视频无损+音频重编失败（${t.message ?: "格式不兼容"}），尝试转码…", null)
+                }
+            }
+            // 第 2.9 级（1.9.3 新增）：H.264/H.265 混合但分辨率/拍摄方向一致的组——
+            // 只转码与目标编码不同的段，其余原样拷贝（"把 h265 转成 h264 再快速拼接"），
+            // 音频统一 AAC，ffmpeg 容器级拼接；任一环节失败回退下面的全量转码
+            if (probeFailed == 0 && ffmpegAvailable() &&
+                partialTranscodeEligible(infos, loadTranscodeSettings(appCtx).shortEdge)
+            ) {
+                checkInternalDiskSpace(appCtx, group)
+                setGroupState(group, "快速拼接中…（仅转码不同编码的段）", null)
+                try {
+                    val (codec, copied) = partialTranscodeConcat(appCtx, items, infos, outUri) { msg ->
+                        setGroupState(group, msg, null)
+                    }
+                    val transcoded = items.size - copied
+                    val codecName = when (codec) { "h265" -> "H.265"; else -> "H.264" }
+                    setGroupState(
+                        group,
+                        if (copied == items.size) "✓ 完成（视频无损拷贝拼接，音频已统一 AAC）"
+                        else "✓ 完成（部分转码：转 $transcoded 段、无损保留 $copied 段，输出 $codecName）",
+                        100
+                    )
+                    return outUri
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    android.util.Log.e(TAG, "partial transcode failed", t)
+                    setGroupState(group, "快速拼接失败（${t.message ?: "格式不兼容"}），改用全量转码…", null)
                 }
             }
             // 第三级（v1.5 新增）：参数不一致或前两级处理不了 → ffmpeg 逐段独立转码成

@@ -552,6 +552,132 @@ private fun outputCodecOf(mime: String?): String = when (mime) {
     else -> "h264"
 }
 
+/* ---------- 部分转码引擎（1.9.3）：只转码异编码段，其余原样拷贝 ----------
+ * 混合 H.264/H.265 但分辨率/拍摄方向一致的组，旧引擎把整组都重新编码——
+ * H.264 段明明不用动也跟着转，白费时间还损画质。这里按目标编码（按时长多数）
+ * 逐段判断：编码相同的段视频像素一个字节不动（仅音频统一重编 AAC），
+ * 不同的段才转码，最后 ffmpeg 容器级拼接 + 成品自检。 */
+
+/** 能否走部分转码：全组可读、只含 H.264/H.265、分辨率一致、无旋转元数据、
+ *  非 HDR、且分辨率压缩设置不会被违反（拷贝段无法重采样缩尺寸） */
+fun partialTranscodeEligible(infos: List<TrackInfo>, shortEdge: Int): Boolean {
+    if (infos.isEmpty() || infos.any { it.videoMime == null }) return false
+    if (infos.any { it.videoMime != "video/avc" && it.videoMime != "video/hevc" }) return false
+    val first = infos.first()
+    if (first.width <= 0 || first.height <= 0) return false
+    // 旋转非 0 的组：拷贝段只能靠元数据携带方向、转码段把方向烤进像素，
+    // 两者混拼成品方向错乱，只能全量转码
+    if (infos.any { it.width != first.width || it.height != first.height || it.rotation != 0 || it.hdr }) return false
+    if (shortEdge > 0 && minOf(first.width, first.height) > shortEdge) return false
+    return true
+}
+
+/** 单段能否视频直拷：编码等于目标，且 profile 是主流档位（避免 10bit/特殊档
+ *  和转码段的 8bit 主档混流播放出问题，这类段宁多转不冒险）。
+ *  注意 MediaFormat.KEY_PROFILE 报的是 CodecProfileLevel 常量值，不是 Annex-A
+ *  的 profile_idc：AVC Baseline/Main/High = 1/2/8，HEVC Main/Main10 = 1/2 */
+private fun canCopySegment(info: TrackInfo, codec: String): Boolean {
+    if (outputCodecOf(info.videoMime) != codec) return false
+    return when (codec) {
+        "h265" -> info.profile == -1 || info.profile == 1            // HEVCProfileMain；Main10(2) 等 10bit 档不拷
+        "h264" -> info.profile == -1 || info.profile in intArrayOf(1, 2, 8)  // AVCProfileBaseline/Main/High
+        else -> false
+    }
+}
+
+/** 视频直拷段：像素不动，音频统一重编成 AAC（与转码段一致），无声段补静音 */
+private suspend fun videoCopySegment(
+    context: Context,
+    item: VideoItem,
+    info: TrackInfo,
+    out: File,
+    onSegProgress: (Int) -> Unit
+) {
+    val input = FFmpegKitConfig.getSafParameterForRead(context, item.uri)
+    val cmd = if (info.hasAudio)
+        "-y -i $input -map 0:v:0 -map 0:a:0 -c:v copy $TRANSCODE_AUDIO -sn -dn '${out.absolutePath}'"
+    else
+        "-y -i $input -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 " +
+            "-map 0:v:0 -map 1:a -shortest -c:v copy $TRANSCODE_AUDIO -sn -dn '${out.absolutePath}'"
+    runFfmpeg(cmd, item.durationMs, onSegProgress)
+}
+
+/**
+ * 部分转码拼接：目标编码段直拷、异编码段走 transcodeSegment（含硬解失败退软解），
+ * 全部音频统一 AAC，ffmpeg concat -c copy 容器级拼接（各段解码配置不同，
+ * mp4parser 单一 stsd 会写坏，必须走 ffmpeg 的多采样条目），拼后成品自检。
+ * 返回 (输出编码名, 无损拷贝的段数)。失败由调用方回退全量转码。
+ */
+suspend fun partialTranscodeConcat(
+    context: Context,
+    items: List<VideoItem>,
+    infos: List<TrackInfo>,
+    outUri: Uri,
+    onProgress: (String) -> Unit
+): Pair<String, Int> {
+    exportGate.withPermit {
+        val settings = loadTranscodeSettings(context)
+        val codec = resolveOutputCodec(infos, items.map { it.durationMs }, settings)
+        val target = infos.first()
+        val targetW = target.width
+        val targetH = target.height
+        val targetFps = target.fps.takeIf { it > 1f } ?: 30f
+        val cacheDir = context.cacheDir
+        val segments = mutableListOf<File>()
+        var copiedCount = 0
+        try {
+            for ((i, item) in items.withIndex()) {
+                val info = infos[i]
+                val seg = File(cacheDir, uniqueTempName("混合段", ".mp4"))
+                segments += seg
+                val progress: (Int) -> Unit = { pct ->
+                    onProgress("快速拼接中 第 ${i + 1}/${items.size} 段（$pct%）")
+                }
+                if (canCopySegment(info, codec)) {
+                    copiedCount++
+                    onProgress("快速拼接中 第 ${i + 1}/${items.size} 段（原样保留）…")
+                    videoCopySegment(context, item, info, seg, progress)
+                } else {
+                    onProgress("快速拼接中 第 ${i + 1}/${items.size} 段（转码为${if (codec == "h265") "H.265" else "H.264"}）…")
+                    val hw = hwDecoderFor(info.videoMime)
+                    try {
+                        transcodeSegment(context, item, info, targetW, targetH, targetFps, codec, seg, hw, progress)
+                    } catch (c: CancellationException) {
+                        throw c
+                    } catch (t: Throwable) {
+                        if (hw == null) throw t
+                        android.util.Log.w(
+                            "VideoStitcher",
+                            "hw decode ($hw) failed for ${item.name}, falling back to software",
+                            t
+                        )
+                        onProgress("快速拼接中 第 ${i + 1}/${items.size} 段（硬解无响应/失败，改用软解重试）…")
+                        transcodeSegment(context, item, info, targetW, targetH, targetFps, codec, seg, null, progress)
+                    }
+                }
+            }
+            // 拼接：各段解码配置（不同相机的 SPS/PPS + 转码段的新参数集）互不相同，
+            // mp4parser 只保留第一段的采样条目会产出解不动的成品，必须走 ffmpeg
+            // concat 的多采样条目路径；拼后有成品自检兜底
+            onProgress("无损拼接中…")
+            val outTmp = File(cacheDir, uniqueTempName("拼接成品", ".mp4"))
+            try {
+                ffmpegConcatCopy(segments, outTmp)
+                copyTmpToOut(context, outTmp, outUri)
+            } finally {
+                outTmp.delete()
+            }
+            val expectedDurationMs = items.sumOf { it.durationMs }
+            verifyOutputUsable(context, outUri, expectedDurationMs, segmentCheckPoints(items))?.let { reason ->
+                throw IllegalStateException("自检未通过：$reason")
+            }
+            return codec to copiedCount
+        } finally {
+            segments.forEach { runCatching { it.delete() } }
+        }
+    }
+}
+
 /** "auto" 模式解析组内实际输出编码：按总时长少数服从多数——哪种编码的素材
  *  总时长最长就输出谁（个数多但都是几秒的零碎小片段不再带偏输出）；平票取
  *  更低世代（H.264 低于 H.265 低于 AV1——老设备兼容面大、软解省电） */
