@@ -109,7 +109,11 @@ data class TrackInfo(
     /** 视频码率（bps），硬件编码按码率控制时作为质量基准 */
     val bitrate: Int = 0,
     /** 音频解码配置字节，用于判断能不能整段直拷音频 */
-    val audioCsd: ByteArray? = null
+    val audioCsd: ByteArray? = null,
+    /** 是否带 B 帧（解码序 PTS 出现回退即判定）：带 B 帧的直拷段过 MPEG-TS
+     *  中转拼接时边界时戳易错乱（ffmpeg concat 已知问题，lossless-cut #3057），
+     *  引擎链据此回避危险组合 */
+    val hasBFrames: Boolean = false
 ) {
     /** 视频流参数是否一致（不含音频）：解码配置字节（csd-0 = avcC/hvcC）一致时，
      *  profile/level/VUI 全部涵盖，比逐字段比对比更严也更快 */
@@ -309,8 +313,9 @@ fun verifyOutputUsable(
  * 这里改为"逐轨首个同步帧 + 头部样本可读 + 结尾附近仍有样本"，能抓住
  * 截尾、空 stss、轨道缺失这三类真机故障，耗时是毫秒级。
  *
- * 刻意不检查时间戳单调性：带 B 帧的码流解码顺序与显示顺序不同，
- * sampleTime 本来就会小幅回退，按单调性判定会误杀完全正常的成品。
+ * 时间戳单调性按"包络回退上限"检查（2.0.3）：带 B 帧的码流解码序 PTS 本来就会
+ * 小幅回退（重排深度内），完全不查会让拼接边界损伤（秒级回退）静默进相册；
+ * 超过 1 秒的回退没有合法解释，判失败让引擎链降级。
  */
 private fun checkSampleIndex(
     context: Context,
@@ -386,6 +391,31 @@ private fun checkSampleIndex(
                     if (!ex.advance()) break
                     readable++
                 }
+                // 2.0.3：音视频轨全量时序包络检查（只走采样表）。视频解码序 PTS
+                // 的局部回退是 B 帧的正常表现（≤ 重排深度，几十~几百毫秒），音频
+                // 没有/极小（一帧 AAC 21ms），但拼接边界损伤会回退整整一段（秒级）
+                // ——旧实现不查单调性，这类坏成品能静默进相册（时间错乱/播放卡死
+                // 的直接来源）。回退超 1 秒判失败，引擎链自动降级下一档
+                if (mime.startsWith("video/") || mime.startsWith("audio/")) {
+                    var envelope = 0L
+                    var worst = 0L
+                    var walked = 0
+                    // advance() 已在上面的 256 步里走过一段，接着走完剩下的即可
+                    while (walked < 300_000) {
+                        val t = ex.sampleTime
+                        if (t < 0) break
+                        if (t > envelope) envelope = t
+                        val back = envelope - t
+                        if (back > worst) worst = back
+                        if (worst > 1_000_000) {
+                            ex.unselectTrack(i)
+                            return "轨道 ${i + 1} 时序错乱：解码序时间戳回退 ${worst / 1000}ms" +
+                                "（拼接边界损坏，播放会卡死/跳秒），已拦截"
+                        }
+                        walked++
+                        if (!ex.advance()) break
+                    }
+                }
                 ex.unselectTrack(i)
             }
             if (expectVideo && videoTracks == 0) return "成品里没有视频轨"
@@ -426,6 +456,7 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
         var extraTracks = 0
         var durationMs = 0L
         var bitrate = 0
+        var videoIdx = -1
         for (i in 0 until extractor.trackCount) {
             val format = extractor.getTrackFormat(i)
             val mime = format.getString(MediaFormat.KEY_MIME)
@@ -439,6 +470,7 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
                 if (us > 0) durationMs = us / 1000
             }
             if (mime.startsWith("video/") && videoMime == null) {
+                videoIdx = i
                 videoMime = mime
                 var w = if (format.containsKey(MediaFormat.KEY_WIDTH)) format.getInteger(MediaFormat.KEY_WIDTH) else 0
                 var h = if (format.containsKey(MediaFormat.KEY_HEIGHT)) format.getInteger(MediaFormat.KEY_HEIGHT) else 0
@@ -472,14 +504,39 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
                 extraTracks++
             }
         }
+        val bFrames = if (videoIdx >= 0) detectBFrames(extractor, videoIdx) else false
         return TrackInfo(
             videoMime, width, height, rotation, fps, audioMime, sampleRate, channels,
-            audioMime != null, profile, hdr, csd, extraTracks, durationMs, bitrate, audioCsd
+            audioMime != null, profile, hdr, csd, extraTracks, durationMs, bitrate, audioCsd, bFrames
         )
     } finally {
         extractor.release()
     }
 }
+
+/**
+ * B 帧判定：MediaExtractor 按解码序吐样本，无 B 帧时解码序=显示序、PTS 严格递增；
+ * 出现任何回退即带 B 帧（I P B 的 B 在 P 之后解码但 PTS 更早）。只走采样表、
+ * 不读帧数据，前 120 个样本足够覆盖任何 GOP 结构。
+ */
+private fun detectBFrames(extractor: MediaExtractor, videoTrackIndex: Int): Boolean = runCatching {
+    extractor.selectTrack(videoTrackIndex)
+    try {
+        var prev = Long.MIN_VALUE
+        var n = 0
+        while (n < 120) {
+            val t = extractor.sampleTime
+            if (t < 0) break
+            if (t < prev) return true
+            prev = t
+            n++
+            if (!extractor.advance()) break
+        }
+        false
+    } finally {
+        extractor.unselectTrack(videoTrackIndex)
+    }
+}.getOrDefault(false)
 
 /** 基于 ParcelFileDescriptor 的随机访问源，供 mp4parser 懒读取 mdat 中的样本数据 */
 private class ChannelRandomAccessSource(private val channel: FileChannel) : RandomAccessSource {
@@ -998,6 +1055,17 @@ fun partialTranscodeEligible(
     if (copyable == 0) return false
     // 目标编码没有软编器（VP8/MPEG-4/H.263）：只要有一段要转就无解
     if (!codec.swEncodable && copyable != infos.size) return false
+    // 2.0.3 门禁：带 B 帧的直拷段 + 各段参数集不一致（要走 MPEG-TS 中转）是
+    // ffmpeg concat 的已知雷区——B 帧解码序/显示序在段边界重叠，产生非单调
+    // DTS（lossless-cut #3057、trac #4924），真机上表现为时间错乱与播放卡死。
+    // 这类组放弃快速拼接、整组退全量转码（转码段由同一编码器统一产出，无此问题）
+    val copiedInfos = infos.filterIndexed { i, _ -> flags[i] }
+    if (copiedInfos.any { it.hasBFrames }) {
+        val mixed = copyable != infos.size
+        val csdUniform = copiedInfos.all { it.csd != null } &&
+            copiedInfos.all { it.csd!!.contentEquals(copiedInfos.first().csd!!) }
+        if (mixed || !csdUniform) return false
+    }
     // 能带内拼参数集的编码（H.264/H.265/MPEG-4）允许"拷一部分、转一部分"；
     // 其余编码（AV1/VP9/VP8）做不到带内参数集，必须全拷且 csd 逐字节一致，
     // 否则成品会出现两套参数集，而 Android 只认第一套（后段花屏/解不动）
@@ -1670,8 +1738,10 @@ private fun inBandCapable(codec: VideoCodec): Boolean =
  *
  *  · H.264 / H.265 / MPEG-4：逐段 `-f mpegts` 重封装。mpegts 复用器会自动插入
  *    h264_mp4toannexb / hevc_mp4toannexb，把**该段自己的** extradata（SPS/PPS）
- *    写进段首；再用 concat 分离器拼成 MP4。回到 MP4 时 mov 只把起始码换成
- *    长度前缀、不剥带内参数集，解码器会在每个 IDR 前重新初始化。
+ *    写进段首；再把各 TS 部分二进制直拼成连续流、按单输入重封装回 MP4（官方
+ *    wiki 配方，2.0.3 起替换 concat 分离器——分离器要按估算时长推算各段起点，
+ *    B 帧边界上多次产出非单调 DTS）。回到 MP4 时 mov 只把起始码换成长度前缀、
+ *    不剥带内参数集，解码器会在每个 IDR 前重新初始化。
  *  · AV1/VP9/VP8 走不了这条路（见 [inBandCapable]），由调用方提前判负、整组重编。
  *
  * 关键点：**每段单独转**。整组一起转时 mp4toannexb 只认第一段的 extradata，
@@ -1711,20 +1781,26 @@ private suspend fun ffmpegConcatInBand(
             doneBytes += sizes[i]
             onPercent((doneBytes * 70 / totalBytes).toInt().coerceIn(0, 70))
         }
-        val list = File(work, "parts.txt")
-        list.writeText(
-            parts.joinToString("\n") { "file '${it.absolutePath.replace("'", "'\\''")}'" }
-        )
         val totalPartBytes = parts.sumOf { runCatching { it.length() }.getOrDefault(0L) }
         val faststart = if (totalPartBytes <= FASTSTART_MAX_BYTES) "-movflags +faststart " else ""
-        // mpegts 默认给首帧留 1.4s 初始偏移；不归零的话成品开头会多一段空 edit
+        // 2.0.3：最终拼装从 concat 分离器改为官方 wiki 配方的"协议级"形态——
+        // 把各 TS 部分二进制直拼成一条连续流、按单输入重封装回 MP4。
+        // 分离器要按"每段估算时长"推算下一段起点（TS 无索引，估不准，且对
+        // start_time/B 帧的对齐在真机 ffmpeg 上多次翻车：trac #4924）；单输入
+        // 则完全由实际包的 DTS/PTS 重建时间轴，没有按段累加偏移的环节
+        val allTs = File(work, "all.ts")
+        runCatching {
+            java.io.FileOutputStream(allTs).use { sink ->
+                for (p in parts) java.io.FileInputStream(p).use { it.copyTo(sink, 1 shl 16) }
+            }
+        }.onFailure { throw IllegalStateException("TS 中转文件拼接失败：${it.message}") }
         runFfmpeg(
-            "-y -f concat -safe 0 -i '${list.absolutePath}' -c copy " +
-                "-avoid_negative_ts make_zero ${faststart}'${out.absolutePath}'",
+            "-y -f mpegts -i '${allTs.absolutePath}' -map 0:v:0 -map 0:a:0? -c copy " +
+                "-bsf:a aac_adtstoasc -avoid_negative_ts make_zero ${faststart}'${out.absolutePath}'",
             durationMs, out, stallTimeoutMs = 600_000L,
             wallTimeoutMs = 6L * 3600 * 1000
         ) { s -> onPercent(70 + s.percent * 30 / 100) }
-        list.delete()
+        runCatching { allTs.delete() }
     } finally {
         parts.forEach { runCatching { it.delete() } }
         runCatching { work.deleteRecursively() }
@@ -1833,6 +1909,17 @@ private suspend fun runFfmpeg(
                     android.util.Log.e("VideoStitcher", "ffmpeg 完整日志: ${it.takeLast(4000)}")
                 }
                 throw IllegalStateException("ffmpeg 失败（returnCode=${s.returnCode}）$tail")
+            }
+            // 2.0.3：成功执行也可能藏着时戳告警（非单调 DTS 被自动"纠正"）——
+            // 记进 logcat 供事后诊断，不因此判失败（成品由自检的包络检查把关）
+            runCatching { s.allLogsAsString }.getOrNull()?.let { logs ->
+                if (logs.contains("on-monoton")) {
+                    android.util.Log.w(
+                        "VideoStitcher",
+                        "ffmpeg 输出含非单调时戳告警（已自动纠正，成品待自检）：" +
+                            "cmd: ${command.take(160)}"
+                    )
+                }
             }
         } catch (e: CancellationException) {
             // Activity 销毁会取消协程：只取消自己这场会话。FFmpegKit.cancel() 无参重载
