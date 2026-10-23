@@ -241,9 +241,11 @@ fun audioCodecDisplay(mime: String?): String = when (mime?.substringAfter('/')) 
 /**
  * 导入时给条目生成编码描述：视频编码 分辨率 · 音频编码，
  * 如 "AV1 1072×1920 · AAC"。探测失败返回空串。
+ *
+ * 2.0 起改为吃已经探测好的 [TrackInfo]：旧实现每次都要重新 open + 建 extractor，
+ * 一条素材在导入、补探、拼前各探一遍，等于同一个文件打开 3~4 次。
  */
-fun probeCodecSummary(context: Context, uri: Uri): String {
-    val info = runCatching { probeVideo(context, uri) }.getOrNull() ?: return ""
+fun probeCodecSummary(info: TrackInfo): String {
     val parts = mutableListOf<String>()
     if (info.videoMime != null) {
         val v = videoCodecDisplay(info.videoMime)
@@ -251,4 +253,10 @@ fun probeCodecSummary(context: Context, uri: Uri): String {
     }
     if (info.hasAudio && info.audioMime != null) parts.add(audioCodecDisplay(info.audioMime))
     return parts.filter { it.isNotBlank() }.joinToString(" · ")
+}
+
+fun probeCodecSummary(context: Context, uri: Uri): String {
+    val info = runCatching { probeVideo(context, uri) }.getOrNull() ?: return ""
+    // probeVideo 顺带带回时长，调用方可以省掉一次 probeDuration
+    return probeCodecSummary(info)
 }

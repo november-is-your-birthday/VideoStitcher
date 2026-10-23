@@ -13,6 +13,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 拼接期间持 partial wake lock：前台服务不阻止 CPU 休眠，熄屏后编解码会被
+         反复挂起，配合 uptimeMillis 看门狗才谈得上"退出应用仍继续"（普通权限，无需授权） -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:allowBackup="true"

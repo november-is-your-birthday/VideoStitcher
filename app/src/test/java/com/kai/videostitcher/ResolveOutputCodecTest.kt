@@ -41,11 +41,19 @@ class ResolveOutputCodecTest {
     }
 
     @Test
-    fun 未收录编码视作H264参与时长比较() {
+    fun 未收录编码一律回落H264() {
+        // 2.0 起不再把未知编码当作 H.264 参与投票：它们本来就必须重编，
+        // 目标直接落到兼容性最好的 H.264（旧行为会因时长多数产出 AV1，慢几十倍）
         val infos = listOf(info("video/whatever"), info("video/av01"))
-        // AV1 总时长更长才输出 AV1，否则落回 H.264
-        assertEquals("av1", resolveOutputCodec(infos, listOf(1_000L, 9_000L), auto))
+        assertEquals("h264", resolveOutputCodec(infos, listOf(1_000L, 9_000L), auto))
         assertEquals("h264", resolveOutputCodec(infos, listOf(9_000L, 1_000L), auto))
+    }
+
+    @Test
+    fun VP9参与投票而不是被当成H264() {
+        // 旧实现 outputCodecOf 的 else 分支把 VP9 记成 H.264，混合组会误判目标
+        val infos = listOf(info("video/x-vnd.on2.vp9"), info("video/x-vnd.on2.vp9"), info("video/avc"))
+        assertEquals("vp9", resolveOutputCodec(infos, listOf(9_000L, 9_000L, 1_000L), auto))
     }
 
     @Test

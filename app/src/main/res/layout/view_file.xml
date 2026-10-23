@@ -37,6 +37,18 @@
             android:layout_height="wrap_content"
             android:textColor="@color/text_secondary"
             android:textSize="11sp" />
+
+        <!-- 行内实时状态：转码中 37% · 1.8× / 直拷中 42% / 已完成打勾。
+             不加每行进度条——几十行同时刷新会掉帧，且卡片高度会跳 -->
+        <TextView
+            android:id="@+id/tvFileState"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="middle"
+            android:maxLines="1"
+            android:textColor="@color/brand_primary"
+            android:textSize="11sp"
+            android:visibility="gone" />
     </LinearLayout>
 
     <Button

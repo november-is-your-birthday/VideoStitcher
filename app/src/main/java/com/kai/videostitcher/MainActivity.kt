@@ -9,12 +9,9 @@ import android.content.res.ColorStateList
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
-import android.os.StatFs
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.View
-import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageView
@@ -62,8 +59,43 @@ class MainActivity : AppCompatActivity() {
         val statusText: TextView,
         val infoText: TextView,
         val fileDurationViews: List<TextView>,
-        val btnDeleteSources: Button
-    )
+        val fileStateViews: List<TextView>,
+        /** 每行 (↑, ↓, ✕)。可用性必须按行位置单独算，不能"整卡统一置为可用" */
+        val rowButtons: List<Triple<Button, Button, Button>>,
+        val nameEditor: EditText,
+        val deleteGroup: Button,
+        val addVideos: TextView,
+        val btnDeleteSources: Button,
+        val group: Group
+    ) {
+        /** 上一次绘制的阶段：只在阶段变化时换胶囊配色，避免每帧重置 drawable */
+        var lastStage: MergeStage? = null
+        /**
+         * 卡片内控件的可用性统一入口。
+         * 旧实现 setUiEnabled 递归把 containerGroups 里所有子 View 置 true，
+         * 覆盖了首行 ↑ / 末行 ↓ 的初始禁用状态；点一下就
+         * Collections.swap(items, 0, -1) → IndexOutOfBoundsException。
+         */
+        fun applyEnabled(merging: Boolean, ctx: Context) {
+            val editable = !merging
+            nameEditor.isEnabled = editable
+            deleteGroup.isEnabled = editable
+            addVideos.isEnabled = editable
+            val canDeleteSources = editable && group.mergedOk
+            btnDeleteSources.isEnabled = canDeleteSources
+            btnDeleteSources.setTextColor(
+                ContextCompat.getColor(
+                    ctx,
+                    if (canDeleteSources) R.color.danger else R.color.text_disabled
+                )
+            )
+            rowButtons.forEachIndexed { i, (up, down, remove) ->
+                up.isEnabled = editable && i > 0
+                down.isEnabled = editable && i < group.items.size - 1
+                remove.isEnabled = editable
+            }
+        }
+    }
 
     // 分组与成品都在全局会话（MergeSession）里：页面销毁/重建（退后台、划任务、
     // 昼夜切换）只是换窗口看同一场拼接，拼接本体在全局协程 + 前台服务里继续
@@ -103,6 +135,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnStart: Button
     private lateinit var btnOpenOutput: Button
     private lateinit var btnNewGroup: Button
+    private lateinit var btnAlbumPick: Button
+    private lateinit var btnOutputSettings: Button
+    private lateinit var btnNightMode: TextView
 
     // 「从文件夹导入」：系统文件夹选择器，所选文件夹（不含子文件夹）里的视频
     // 整体导入为一个新分组
@@ -188,23 +223,26 @@ class MainActivity : AppCompatActivity() {
         btnStart = findViewById(R.id.btnStart)
         btnOpenOutput = findViewById(R.id.btnOpenOutput)
         btnNewGroup = findViewById(R.id.btnNewGroup)
+        btnAlbumPick = findViewById(R.id.btnAlbumPick)
+        btnOutputSettings = findViewById(R.id.btnOutputSettings)
+        btnNightMode = findViewById(R.id.btnNightMode)
 
         btnNewGroup.setOnClickListener {
             if (!merging) pickTree.launch(null)
         }
-        findViewById<Button>(R.id.btnAlbumPick).setOnClickListener {
+        btnAlbumPick.setOnClickListener {
             // "从相册选"走系统照片选择器（与其它应用的体验一致）；
             // 极少数没有系统选择器的设备退回内置相册选择器兜底
             if (!merging) launchSystemVideoPicker()
         }
         btnStart.setOnClickListener { if (merging) stopMerging() else onStartClicked() }
         btnOpenOutput.setOnClickListener { openLastOutput() }
-        findViewById<Button>(R.id.btnOutputSettings).setOnClickListener { showOutputSettingsDialog() }
+        btnOutputSettings.setOnClickListener { if (!merging) showOutputSettingsDialog() }
         refreshOutputSettingsLabel()
 
         // 标题栏的昼夜切换：显示当前模式的图标，点击切到另一种模式
         // （拼接中不响应：切换会重建页面，会打断正在进行的拼接）
-        findViewById<TextView>(R.id.btnNightMode).apply {
+        btnNightMode.apply {
             updateNightGlyph(this)
             setOnClickListener {
                 if (merging) return@setOnClickListener
@@ -230,6 +268,15 @@ class MainActivity : AppCompatActivity() {
         MergeSession.addListener(sessionListener)
         renderSessionUi()
         initBoxParser(applicationContext)
+        // 上次进程被杀留下的中间件与"仍在写入"的相册条目：启动时清一次，
+        // 否则缓存目录会越积越大、相册里还会留着 0 字节的视频。
+        // 拼接进行中绝不能清：页面因配置变化重建时，这些正是正在用的分段与输出条目
+        if (!MergeSession.merging) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                cleanupStaleTempFiles(applicationContext)
+                cleanupPendingOutputs(applicationContext)
+            }
+        }
         ensureMediaPermission()
         ensureNotificationPermission()
         // 旧版本保存的分组没有编码信息，启动时补探一次（已有编码的条目会跳过）
@@ -241,8 +288,9 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    /** 全局拼接状态一变（进度/完成/停止），把它画到当前页面上 */
-    private val sessionListener: () -> Unit = { runOnUiThread { renderSessionUi() } }
+    /** 全局拼接状态一变（进度/完成/停止），把它画到当前页面上。
+     *  MergeSession 已保证监听者都在主线程回调，这里不必再 runOnUiThread 转一道 */
+    private val sessionListener: () -> Unit = { renderSessionUi() }
 
     /** 把会话状态同步到界面：开始/结束的整体控件翻转 + 各分组状态胶囊 */
     private fun renderSessionUi() {
@@ -253,17 +301,28 @@ class MainActivity : AppCompatActivity() {
             updateMergeButton()
             pbOverall.isVisible = merging
             btnOpenOutput.isVisible = !merging && outputs.isNotEmpty()
-            if (merging) {
-                tvStatus.text = MergeSession.overallText
-            } else {
+            if (!merging) {
                 tvStatus.text = MergeSession.finalText.ifEmpty { "准备就绪" }
                 refreshDeleteSourceButtons()
             }
-        } else if (merging) {
-            tvStatus.text = MergeSession.overallText
         }
         for ((group, state) in MergeSession.states) {
-            applyGroupState(group, state.first, state.second)
+            applyProgress(group, state)
+        }
+        if (merging) {
+            val overall = MergeSession.overall
+            val pct = overall.percent
+            // 总进度改为确定态：进度条按整轮加权百分比走，不再是无意义的来回滑动
+            pbOverall.isIndeterminate = pct == null
+            if (pct != null) pbOverall.progress = pct
+            val cur = MergeSession.currentGroup?.let { MergeSession.states[it] }
+            tvStatus.text = buildString {
+                append(overall.text)
+                if (pct != null) append(" · 整体 ").append(pct).append('%')
+                if (cur != null && cur.stage != MergeStage.DONE) {
+                    append(" · ").append(StatusText.title(cur))
+                }
+            }
         }
     }
 
@@ -402,9 +461,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun fillDurationsAsync(group: Group) {
         lifecycleScope.launch(Dispatchers.IO) {
-            for (item in group.items) {
+            // 必须先快照：探测是耗时操作，期间用户可能删除/追加条目。直接遍历活列表
+            // 会让迭代器抛 ConcurrentModificationException，而 launch 里没人接这个
+            // 异常 → AndroidExceptionPreHandler 在主线程重抛 → 应用直接退出。
+            // 快照里的条目即使已被移除，写回时长也只是写到孤立对象上，无害。
+            val snapshot = group.items.toList()
+            for (item in snapshot) {
+                if (item.durationMs > 0 && item.codec.isNotEmpty()) continue
+                // 一次 probeVideo 同时拿到时长与编码描述：旧实现先 probeDuration
+                // 再 probeCodecSummary（内部又 probeVideo 一次），同一条素材开三遍
+                val info = runCatching { probeVideo(this@MainActivity, item.uri) }.getOrNull()
+                if (info != null) {
+                    if (item.durationMs <= 0 && info.durationMs > 0) item.durationMs = info.durationMs
+                    if (item.codec.isEmpty()) item.codec = probeCodecSummary(info)
+                }
                 if (item.durationMs <= 0) item.durationMs = probeDuration(this@MainActivity, item.uri)
-                if (item.codec.isEmpty()) item.codec = probeCodecSummary(this@MainActivity, item.uri)
             }
             withContext(Dispatchers.Main) {
                 // 只更新受影响的文本，不整树 render()：render 会重建全部卡片，
@@ -498,6 +569,8 @@ class MainActivity : AppCompatActivity() {
 
         val thumbViews = HashMap<String, ImageView>()
         val fileDurationViews = mutableListOf<TextView>()
+        val fileStateViews = mutableListOf<TextView>()
+        val rowButtons = mutableListOf<Triple<Button, Button, Button>>()
         group.items.forEachIndexed { index, item ->
             val row = layoutInflater.inflate(R.layout.view_file, llFiles, false)
             val thumb = row.findViewById<ImageView>(R.id.ivThumb)
@@ -509,7 +582,9 @@ class MainActivity : AppCompatActivity() {
                 listOf(formatDuration(item.durationMs), item.codec).filter { it.isNotEmpty() }
                     .joinToString(" · ")
             fileDurationViews.add(row.findViewById(R.id.tvFileDuration))
-            row.findViewById<Button>(R.id.btnRemove).setOnClickListener {
+            fileStateViews.add(row.findViewById(R.id.tvFileState))
+            val btnRemove = row.findViewById<Button>(R.id.btnRemove)
+            btnRemove.setOnClickListener {
                 if (merging) return@setOnClickListener
                 group.items.removeAt(index)
                 group.mergedOk = false
@@ -524,17 +599,20 @@ class MainActivity : AppCompatActivity() {
             // ↑↓ 调整顺序（1.9.1 起恢复按钮排序，替代 1.7.0 的长按拖动手柄）
             val up = row.findViewById<Button>(R.id.btnUp)
             val down = row.findViewById<Button>(R.id.btnDown)
+            rowButtons.add(Triple(up, down, btnRemove))
             up.isEnabled = index > 0
             down.isEnabled = index < group.items.size - 1
             up.setOnClickListener {
-                if (merging) return@setOnClickListener
+                // 边界判断是必需的第二道锁：按钮的 isEnabled 会在整卡刷新时被重算，
+                // 少了这行，首行 ↑ 一旦被误启用就是 swap(items, 0, -1) 崩溃
+                if (merging || index <= 0 || index >= group.items.size) return@setOnClickListener
                 Collections.swap(group.items, index, index - 1)
                 // 顺序变了：已拼接状态失效（红色删源按钮退回灰色）
                 group.mergedOk = false
                 render()
             }
             down.setOnClickListener {
-                if (merging) return@setOnClickListener
+                if (merging || index < 0 || index >= group.items.size - 1) return@setOnClickListener
                 Collections.swap(group.items, index, index + 1)
                 group.mergedOk = false
                 render()
@@ -544,7 +622,9 @@ class MainActivity : AppCompatActivity() {
 
         // 异步加载缺失的封面缩略图，加载完成后仅刷新对应 ImageView
         lifecycleScope.launch(Dispatchers.IO) {
-            for (item in group.items) {
+            // 快照后再遍历：用户在缩略图加载期间删/加视频时，直接遍历活列表会抛
+            // ConcurrentModificationException，协程未捕获 → 应用崩溃
+            for (item in group.items.toList()) {
                 val key = item.uri.toString()
                 if (Thumbs.get(key) != null) continue
                 val bmp = Thumbs.load(applicationContext, item.uri) ?: continue
@@ -555,7 +635,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        cardViews[group] = CardViews(pbGroup, tvStatusGroup, tvInfo, fileDurationViews, btnDeleteSources)
+        cardViews[group] = CardViews(
+            pbGroup, tvStatusGroup, tvInfo, fileDurationViews, fileStateViews, rowButtons,
+            etName, btnDelete, card.findViewById(R.id.btnAddVideos), btnDeleteSources, group
+        )
         return card
     }
 
@@ -584,7 +667,11 @@ class MainActivity : AppCompatActivity() {
         if (MergeSession.merging) return
         // 只拼还没拼成功的分组：mergedOk 的组保留成品原样不动
         val targets = groups.filter { it.items.isNotEmpty() && !it.mergedOk }
-        MergeSession.begin()
+        // 本轮设置快照：拼接期间即使用户改了输出设置，也不影响已经开始的一轮。
+        // 旧实现里 partialTranscodeEligible 用旧设置判断、引擎内部又 reload 一次，
+        // 中途改分辨率会让"直拷段（原尺寸）"和"转码段（缩放后）"混拼成一个文件
+        val roundSettings = loadTranscodeSettings(this)
+        MergeSession.begin(targets)
         MergeService.start(applicationContext)
         renderSessionUi()
         // 引擎链只拿 applicationContext：拼接可能比本页面活得久，持有 Activity
@@ -596,8 +683,9 @@ class MainActivity : AppCompatActivity() {
                 // 多个分组按列表顺序逐组拼接：一次只跑一组，状态一目了然，
                 // 单组也能吃满解码/转码资源，多组并行互相抢 CPU 反而更慢
                 for ((idx, group) in targets.withIndex()) {
+                    MergeSession.setCurrent(group)
                     try {
-                        val out = mergeGroup(appCtx, group)
+                        val out = mergeGroup(appCtx, group, roundSettings)
                         outputs.add(out)
                         succeeded.add(group)
                         // 顺序拼接完成一组点亮一组：立即标记成功并落盘，
@@ -605,20 +693,20 @@ class MainActivity : AppCompatActivity() {
                         withContext(NonCancellable) {
                             group.mergedOk = true
                             Store.save(appCtx, groups)
-                            if (idx < targets.size - 1) {
-                                MergeSession.overallText = "拼接中…已完成 ${idx + 1}/${targets.size} 组"
-                                MergeSession.notifyChanged()
-                            }
                         }
                     } catch (c: CancellationException) {
                         // 取消不是失败：向上传播，别把取消误标成"✗ 失败"
                         throw c
                     } catch (t: Throwable) {
-                        setGroupState(group, "✗ 失败：${t.message ?: t.javaClass.simpleName}", -1)
-                        if (idx < targets.size - 1) {
-                            MergeSession.overallText = "拼接中…已完成 ${idx}/${targets.size} 组"
-                            MergeSession.notifyChanged()
-                        }
+                        publish(
+                            group,
+                            GroupProgress(
+                                MergeStage.FAILED,
+                                percent = 0,
+                                note = "失败：${t.message ?: t.javaClass.simpleName}"
+                            ),
+                            force = true
+                        )
                     }
                 }
                 MergeSession.finish(outputs.size, targets.size)
@@ -635,14 +723,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 输出设置摘要标签：原尺寸 · 自动 / 720p · H.265 … */
+    /** 输出设置摘要标签：原尺寸 · 自动 · 软编 / 720p · H.265 · 硬编 … */
     private fun refreshOutputSettingsLabel() {
         val s = loadTranscodeSettings(this)
         val res = when (s.shortEdge) { 1080 -> "1080p"; 720 -> "720p"; else -> "原尺寸" }
         val codec = when (s.codecMode) {
             "h265" -> "H.265"; "av1" -> "AV1"; "h264" -> "H.264"; else -> "自动跟随源"
         }
-        findViewById<Button>(R.id.btnOutputSettings).text = "输出设置：$res · $codec（仅转码组生效）"
+        val enc = if (s.encoderMode == "hw") "硬编" else "软编"
+        btnOutputSettings.text = "输出设置：$res · $codec · $enc（仅转码组生效）"
     }
 
     /** 输出设置对话框：分辨率压缩 + 编码格式。只影响需要转码的分组 */
@@ -650,19 +739,26 @@ class MainActivity : AppCompatActivity() {
         val cur = loadTranscodeSettings(this)
         val resNames = arrayOf("保持原尺寸（默认）", "压缩到 1080p", "压缩到 720p（最小体积）")
         val resValues = intArrayOf(0, 1080, 720)
-        val av1Ok = av1EncodeAvailable()
+        // 本机 ffmpeg 构建只带 libaom-av1（无 libsvtav1）：AV1 能编，但慢得多。
+        // 旧文案只写"体积最小"，用户选完才发现要等半小时；这里把真实代价写清楚
         val codecNames = arrayOf(
             "自动（跟随源视频编码，混合时按总时长最多者）",
-            "H.264（推荐：兼容性最好）",
-            "H.265（体积约省 30-50%，转码更慢，老设备可能不支持）",
-            if (av1Ok) "AV1（体积最小，播放兼容性较弱）"
-            else "AV1（本机编码组件不支持，选了也会回退 H.264）"
+            "H.264（推荐：兼容性最好、转码最快）",
+            "H.265（体积约省 30-50%，耗时约为 H.264 的 3-4 倍）",
+            "AV1（体积最小；本机为软件编码，耗时约为 H.264 的 15-40 倍）"
         )
         val codecValues = arrayOf("auto", "h264", "h265", "av1")
+        val encNames = arrayOf(
+            "质量优先（软件编码，全机型行为一致，默认）",
+            "速度优先（硬件编码，约快 5-15 倍；画质按码率控制）"
+        )
+        val encValues = arrayOf("sw", "hw")
         val checkedRes = resValues.indexOf(cur.shortEdge).coerceAtLeast(0)
         val checkedCodec = codecValues.indexOf(cur.codecMode).coerceAtLeast(0)
+        val checkedEnc = encValues.indexOf(cur.encoderMode).coerceAtLeast(0)
         var selRes = cur.shortEdge
         var selCodec = cur.codecMode
+        var selEnc = cur.encoderMode
 
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -691,10 +787,14 @@ class MainActivity : AppCompatActivity() {
         container.addView(radioGroup(resNames, checkedRes) { i -> selRes = resValues[i] })
         container.addView(sectionLabel("输出编码", 24))
         container.addView(radioGroup(codecNames, checkedCodec) { i -> selCodec = codecValues[i] })
+        container.addView(sectionLabel("编码引擎（决定转码速度）", 24))
+        container.addView(radioGroup(encNames, checkedEnc) { i -> selEnc = encValues[i] })
         container.addView(TextView(this).apply {
             text = "仅对参数不一致、需要转码的分组生效；无损拼接的分组永远保持原画质不变。" +
                 "自动模式下编码不统一的分组按总时长最多的编码输出（平票取 H.264），" +
-                "且只转码编码不同的段，其余段原样拷贝。"
+                "且只转码需要改动的段，其余段原样拷贝。\n\n" +
+                "硬件编码仅对 H.264/H.265 且短边 ≥1080 的素材生效，按码率控制画质；" +
+                "设备不支持、编码失败或成品自检不通过时会自动退回软件编码。"
             textSize = 12f
             setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
             setPadding(0, 24, 0, 0)
@@ -704,7 +804,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle("输出设置")
             .setView(container)
             .setPositiveButton("保存") { _, _ ->
-                saveTranscodeSettings(this, TranscodeSettings(selRes, selCodec))
+                saveTranscodeSettings(this, TranscodeSettings(selRes, selCodec, selEnc))
                 refreshOutputSettingsLabel()
                 toast("输出设置已保存")
             }
@@ -739,18 +839,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshDeleteSourceButtons() {
-        groups.forEach { g ->
-            cardViews[g]?.let { cv ->
-                val active = g.mergedOk && !merging
-                cv.btnDeleteSources.isEnabled = active
-                cv.btnDeleteSources.setTextColor(
-                    ContextCompat.getColor(
-                        this,
-                        if (active) R.color.danger else R.color.text_disabled
-                    )
-                )
-            }
-        }
+        // 卡片内所有控件的可用性都走同一个入口：行位置相关的禁用状态不会被拉平
+        for ((_, cv) in cardViews) cv.applyEnabled(merging, this)
     }
 
     /**
@@ -838,8 +928,8 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private suspend fun mergeGroup(appCtx: Context, group: Group): Uri {
-        setGroupState(group, "检查视频可读性…", null)
+    private suspend fun mergeGroup(appCtx: Context, group: Group, settings: TranscodeSettings): Uri {
+        publish(group, GroupProgress(MergeStage.READ_CHECK, percent = 0), force = true)
         // 授权失效/文件被移动的视频提前发现，给出可操作的提示而不是神秘报错
         val unreadable = group.items.count { item ->
             runCatching { appCtx.contentResolver.openFileDescriptor(item.uri, "r")!!.close() }.isFailure
@@ -847,8 +937,8 @@ class MainActivity : AppCompatActivity() {
         if (unreadable > 0) {
             throw IllegalStateException("有 $unreadable 个视频无法读取（可能已被移动、删除或授权失效），请把它们从分组中删除后重新添加")
         }
-        checkDiskSpace(appCtx, group)
-        setGroupState(group, "分析视频参数…", null)
+        checkDiskSpace(appCtx, group.items)
+        publish(group, GroupProgress(MergeStage.PROBE, percent = 3), force = true)
         // 逐项并行探测：几十条的分组串行要探几十秒，并行只花最长那一条的时间
         var infos = coroutineScope {
             group.items.map { item ->
@@ -860,16 +950,30 @@ class MainActivity : AppCompatActivity() {
                 }
             }.awaitAll()
         }
+        // 探测顺带带回时长与编码描述：回写到条目，后面不必再为同一素材开一次 extractor
+        infos.forEachIndexed { i, info ->
+            val item = group.items.getOrNull(i) ?: return@forEachIndexed
+            if (item.durationMs <= 0 && info.durationMs > 0) item.durationMs = info.durationMs
+            if (item.codec.isEmpty()) item.codec = probeCodecSummary(info)
+        }
         // 带外来轨的输入（Android 13+ 录屏的 mett 元数据轨、字幕/时间码轨）所有引擎
         // 都读不了：先 -c copy 无损剥离再进引擎链；个别剥离失败的原样保留不更糟
         var workItems = group.items
         val cleanedFiles = mutableListOf<File>()
         try {
             if (infos.any { it.extraTracks > 0 }) {
-                setGroupState(group, "清理附加数据轨…", null)
                 val work = mutableListOf<VideoItem>()
                 group.items.forEachIndexed { i, item ->
                     if (infos[i].extraTracks > 0) {
+                        publish(
+                            group,
+                            GroupProgress(
+                                MergeStage.STRIP,
+                                SegmentProgress(i + 1, group.items.size, item.name, "", "", false, 0),
+                                percent = ProgressMath.stagePercent(MergeStage.STRIP, i * 100 / group.items.size.coerceAtLeast(1))
+                            ),
+                            force = true
+                        )
                         val tmp = File(appCtx.cacheDir, uniqueTempName("剥轨", ".mp4"))
                         if (stripForeignTracks(appCtx, item.uri, tmp)) {
                             cleanedFiles.add(tmp)
@@ -882,6 +986,7 @@ class MainActivity : AppCompatActivity() {
                         work.add(item)
                     }
                 }
+                publish(group, GroupProgress(MergeStage.STRIP, percent = 10), force = true)
                 if (work != group.items.toList()) {
                     workItems = work
                     infos = infos.mapIndexed { i, info ->
@@ -900,19 +1005,29 @@ class MainActivity : AppCompatActivity() {
             }
             val expectedDurationMs = workItems.sumOf { it.durationMs }
             val mp4Family = workItems.all { isLosslessCapableName(it.name) }
-            // mp4parser 解析不了 AV1 的 av01 采样条目（实测抛异常），无损路径必须排除 AV1
-            val hasAv1 = infos.any { it.videoMime == "video/av01" }
+            // mp4parser 容器级追加的硬约束（2.0.0 补齐，两条都是"宁可降一档也不硬拼"）：
+            // 1) 只认 avc1/avcC 采样条目：hvc1 克隆会丢 hvcC、写空 stss（成品没画面），
+            //    av01 解析直接抛异常；vp09/mp4v/dvh1 也没有可靠的克隆实现。
+            //    用白名单，不再"排除 av01/hevc 就算安全"——那会把 VP9/MPEG-4/DV 漏进来
+            // 2) 每段 csd（avcC 字节）必须真实存在：matchesVideoOnly 在 csd 缺失时
+            //    会按"拿不到字节就不判不一致"放行，等于让 mp4parser 去硬拼两套 SPS/PPS
+            val mp4parserSafe = mp4Family &&
+                infos.all { it.videoMime == "video/avc" && it.csd != null }
             val probeFailed = infos.count { it.videoMime == null }
-            return runMergeEngines(appCtx, group, workItems, infos, expectedDurationMs, paramsUniform, mp4Family, hasAv1, probeFailed)
+            return runMergeEngines(
+                appCtx, group, workItems, infos, expectedDurationMs,
+                paramsUniform, mp4parserSafe, probeFailed, settings
+            )
         } finally {
             cleanedFiles.forEach { runCatching { it.delete() } }
         }
     }
 
     /**
-     * 三级引擎链：无损拼接 → 无损转封装 → ffmpeg 转码 → 中止。
-     * 成功返回输出 Uri。中途取消（旋转屏幕/退页面/后台被杀）会删掉已创建的
+     * 引擎链：无损拼接 → 无损转封装 → 视频无损+音频重编 → 部分转码（全格式直拷）→ 全量转码。
+     * 成功返回输出 Uri。中途取消（旋转屏幕/退页面/被杀）会删掉已创建的
      * 半截输出条目再向上传播取消——否则相册里会留下一个解不动的残缺 MP4。
+     * 输出条目全程带 IS_PENDING 标记，写完才真正出现在相册里（见 createOutputUri）。
      */
     private suspend fun runMergeEngines(
         appCtx: Context,
@@ -921,31 +1036,67 @@ class MainActivity : AppCompatActivity() {
         infos: List<TrackInfo>,
         expectedDurationMs: Long,
         paramsUniform: Boolean,
-        mp4Family: Boolean,
-        hasAv1: Boolean,
-        probeFailed: Int
+        mp4parserSafe: Boolean,
+        probeFailed: Int,
+        settings: TranscodeSettings
     ): Uri {
         var outUri = createOutputUri(appCtx, sanitizeFileName("${group.name}_合并.mp4"))
+        fun resetOutput(): Uri {
+            discardOutput(appCtx, outUri)
+            return createOutputUri(appCtx, sanitizeFileName("${group.name}_合并.mp4"))
+        }
+
+        fun verifyOrFail(points: List<Long>) {
+            publish(group, GroupProgress(MergeStage.VERIFY, percent = 97), force = true)
+            verifyOutputUsable(appCtx, outUri, expectedDurationMs, points, expectVideo = true)
+                ?.let { reason -> throw IllegalStateException("自检未通过：$reason") }
+        }
+
         try {
-            if (paramsUniform && mp4Family && !hasAv1) {
-                setGroupState(group, "无损拼接中…（不重新编码，秒级完成）", null)
+            if (paramsUniform && mp4parserSafe) {
+                publish(
+                    group,
+                    GroupProgress(
+                        MergeStage.LOSSLESS,
+                        percent = ProgressMath.stagePercent(MergeStage.LOSSLESS, 0),
+                        note = "不重新编码，画质零损失"
+                    ),
+                    force = true
+                )
                 try {
                     appCtx.contentResolver.openFileDescriptor(outUri, "rw")!!.use { pfd ->
-                        concatLossless(appCtx, items, pfd)
+                        concatLossless(appCtx, items, pfd) { p ->
+                            publish(
+                                group,
+                                GroupProgress(
+                                    MergeStage.LOSSLESS,
+                                    percent = ProgressMath.stagePercent(MergeStage.LOSSLESS, p)
+                                )
+                            )
+                        }
                     }
                     // 成品必须自检通过：拼接"成功"不等于能播放，不过就降级下一档
-                    verifyOutputUsable(appCtx, outUri, expectedDurationMs, segmentCheckPoints(items))
-                        ?.let { reason -> throw IllegalStateException("自检未通过：$reason") }
-                    setGroupState(group, "✓ 完成（无损拼接，画质无损失）", 100)
+                    verifyOrFail(segmentCheckPoints(items))
+                    publishOutput(appCtx, outUri)
+                    publish(
+                        group,
+                        GroupProgress(MergeStage.DONE, percent = 100, note = "完成（无损拼接，画质无损失）"),
+                        force = true
+                    )
                     return outUri
                 } catch (c: CancellationException) {
                     throw c
                 } catch (t: Throwable) {
                     android.util.Log.e(TAG, "lossless failed, trying alternatives", t)
-                    runCatching { appCtx.contentResolver.delete(outUri, null, null) }
-                    // 重新创建输出条目，否则后续拼接无处可写
-                    outUri = createOutputUri(appCtx, sanitizeFileName("${group.name}_合并.mp4"))
-                    setGroupState(group, "无损模式失败（${t.message ?: "格式不兼容"}），尝试其它方式…", null)
+                    outUri = resetOutput()
+                    publish(
+                        group,
+                        GroupProgress(
+                            MergeStage.LOSSLESS, percent = 0,
+                            note = "无损模式失败（${t.message ?: "格式不兼容"}），尝试其它方式…"
+                        ),
+                        force = true
+                    )
                 }
             }
             // 无损转封装只处理无旋转元数据的组：转封装走 media3 的序列管线，
@@ -955,74 +1106,106 @@ class MainActivity : AppCompatActivity() {
                 // 参数一致且编码能直封进 MP4（任意容器，含 MKV/WebM/TS/AV1）：
                 // 直接拷贝压缩流换壳，不解码不重编码
                 try {
-                    transmuxConcat(appCtx, items, outUri) { p ->
-                        setGroupState(group, "无损转封装中 $p%…", p)
-                    }
-                    verifyOutputUsable(appCtx, outUri, expectedDurationMs, segmentCheckPoints(items))
-                        ?.let { reason -> throw IllegalStateException("自检未通过：$reason") }
-                    setGroupState(group, "✓ 完成（无损转封装，无重编码）", 100)
-                    return outUri
-                } catch (c: CancellationException) {
-                    throw c
-                } catch (t: Throwable) {
-                    android.util.Log.e(TAG, "transmux failed", t)
-                    setGroupState(group, "转封装失败（${t.message ?: "格式不兼容"}），尝试其它无损方式…", null)
-                }
-            }
-            // 第二级半（1.5.4 新增）：视频参数完全一致（含 csd 解码配置字节逐字节一致）
-            // 但音频不一致的组——视频流一个字节不动、只重编音频（秒级）。录屏混相机、
-            // 44.1k 混 48k 这类常见组从分钟级转码降到秒级，且视频零画质损失
-            if (mp4Family && probeFailed == 0 &&
-                infos.all { it.csd != null && it.matchesVideoOnly(infos.first()) }
-            ) {
-                setGroupState(group, "视频无损拼接中（仅音频重编，秒级）…", null)
-                try {
-                    videoCopyConcatAudio(appCtx, items, infos, outUri) { msg ->
-                        setGroupState(group, msg, null)
-                    }
-                    setGroupState(group, "✓ 完成（视频无损 + 音频重编，画质无损失）", 100)
-                    return outUri
-                } catch (c: CancellationException) {
-                    throw c
-                } catch (t: Throwable) {
-                    android.util.Log.e(TAG, "video-copy concat failed", t)
-                    setGroupState(group, "视频无损+音频重编失败（${t.message ?: "格式不兼容"}），尝试转码…", null)
-                }
-            }
-            // 第 2.9 级（1.9.3 新增）：H.264/H.265 混合但分辨率/拍摄方向一致的组——
-            // 只转码与目标编码不同的段，其余原样拷贝（"把 h265 转成 h264 再快速拼接"），
-            // 音频统一 AAC，ffmpeg 容器级拼接；任一环节失败回退下面的全量转码
-            if (probeFailed == 0 && ffmpegAvailable() &&
-                partialTranscodeEligible(infos, loadTranscodeSettings(appCtx).shortEdge)
-            ) {
-                checkInternalDiskSpace(appCtx, group)
-                setGroupState(group, "快速拼接中…（仅转码不同编码的段）", null)
-                try {
-                    val (codec, copied) = partialTranscodeConcat(appCtx, items, infos, outUri) { msg ->
-                        setGroupState(group, msg, null)
-                    }
-                    val transcoded = items.size - copied
-                    val codecName = when (codec) { "h265" -> "H.265"; else -> "H.264" }
-                    setGroupState(
+                    transmuxConcat(appCtx, items, outUri) { p -> publish(group, p) }
+                    verifyOrFail(segmentCheckPoints(items))
+                    publishOutput(appCtx, outUri)
+                    publish(
                         group,
-                        if (copied == items.size) "✓ 完成（视频无损拷贝拼接，音频已统一 AAC）"
-                        else "✓ 完成（部分转码：转 $transcoded 段、无损保留 $copied 段，输出 $codecName）",
-                        100
+                        GroupProgress(MergeStage.DONE, percent = 100, note = "完成（无损转封装，无重编码）"),
+                        force = true
                     )
                     return outUri
                 } catch (c: CancellationException) {
                     throw c
                 } catch (t: Throwable) {
-                    android.util.Log.e(TAG, "partial transcode failed", t)
-                    setGroupState(group, "快速拼接失败（${t.message ?: "格式不兼容"}），改用全量转码…", null)
+                    android.util.Log.e(TAG, "transmux failed", t)
+                    outUri = resetOutput()
+                    publish(
+                        group,
+                        GroupProgress(
+                            MergeStage.TRANSMUX, percent = 0,
+                            note = "转封装失败（${t.message ?: "格式不兼容"}），尝试其它无损方式…"
+                        ),
+                        force = true
+                    )
                 }
             }
-            // 第三级（v1.5 新增）：参数不一致或前两级处理不了 → ffmpeg 逐段独立转码成
-            // 统一参数再拼。x264 软编全机型行为一致，绕开真机硬件会话差异的坑；
+            // 第二级半（1.5.4 新增）：视频参数完全一致（含 csd 解码配置字节逐字节一致）
+            // 但音频不一致的组——视频流一个字节不动、只重编音频（秒级）。录屏混相机、
+            // 44.1k 混 48k 这类常见组从分钟级转码降到秒级，且视频零画质损失
+            // 这里同样走 mp4parser，编码/csd 约束与上面一致（mp4parserSafe 已包含）
+            if (mp4parserSafe && probeFailed == 0 &&
+                infos.all { it.matchesVideoOnly(infos.first()) }
+            ) {
+                try {
+                    videoCopyConcatAudio(appCtx, items, infos, outUri) { p -> publish(group, p) }
+                    publishOutput(appCtx, outUri)
+                    publish(
+                        group,
+                        GroupProgress(MergeStage.DONE, percent = 100, note = "完成（视频无损 + 音频重编，画质无损失）"),
+                        force = true
+                    )
+                    return outUri
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    android.util.Log.e(TAG, "video-copy concat failed", t)
+                    outUri = resetOutput()
+                    publish(
+                        group,
+                        GroupProgress(
+                            MergeStage.AUDIO_REDO, percent = 0,
+                            note = "视频无损+音频重编失败（${t.message ?: "格式不兼容"}），尝试转码…"
+                        ),
+                        force = true
+                    )
+                }
+            }
+            // 第 2.9 级：只转码需要改动的段，其余原样拷贝。2.0 起放开到所有
+            // 本机可解码的编码（H.264/H.265/AV1/VP9…），不再只认 H.264/H.265
+            if (probeFailed == 0 && ffmpegAvailable()) {
+                val durations = items.map { it.durationMs }
+                val codecId = resolveOutputCodec(infos, durations, settings)
+                if (partialTranscodeEligible(infos, durations, settings, codecId)) {
+                    checkInternalDiskSpace(appCtx, items)
+                    try {
+                        val result = partialTranscodeConcat(appCtx, items, infos, outUri, settings) { p ->
+                            publish(group, p)
+                        }
+                        publishOutput(appCtx, outUri)
+                        val transcoded = items.size - result.copied
+                        val codecName = VideoCodec.ofId(result.codec).display
+                        val hw = if (result.hwEncoded > 0) "，其中 ${result.hwEncoded} 段硬件编码" else ""
+                        val note = if (result.copied == items.size)
+                            "完成（视频无损拷贝拼接，音频已统一 AAC）"
+                        else "完成（转 $transcoded 段、直拷 ${result.copied} 段，输出 $codecName$hw）"
+                        publish(
+                            group,
+                            GroupProgress(MergeStage.DONE, percent = 100, note = note),
+                            force = true
+                        )
+                        return outUri
+                    } catch (c: CancellationException) {
+                        throw c
+                    } catch (t: Throwable) {
+                        android.util.Log.e(TAG, "partial transcode failed", t)
+                        outUri = resetOutput()
+                        publish(
+                            group,
+                            GroupProgress(
+                                MergeStage.SEG_TRANSCODE, percent = 0,
+                                note = "快速拼接失败（${t.message ?: "格式不兼容"}），改用全量转码…"
+                            ),
+                            force = true
+                        )
+                    }
+                }
+            }
+            // 第三级：参数不一致或前几级处理不了 → ffmpeg 逐段独立转码成统一参数再拼。
             // 拼前有 SPS/PPS 闸门、拼后有成品自检，最坏情况是中止，不产出坏文件
             if (probeFailed == 0) {
                 if (!ffmpegAvailable()) {
-                    runCatching { appCtx.contentResolver.delete(outUri, null, null) }
+                    discardOutput(appCtx, outUri)
                     throw IllegalStateException(
                         "这组视频参数不一致，而本机 CPU 架构不支持转码引擎（需要 64 位 ARM 或 x86_64 设备）。" +
                             "请把它们自行转码成参数一致的普通 MP4 后再导入"
@@ -1030,20 +1213,28 @@ class MainActivity : AppCompatActivity() {
                 }
                 // 真正落到转码级才检查内置分区（转码分段中间文件都在 cacheDir）：
                 // 运行期从无损降级下来的组也躲不过这一关
-                checkInternalDiskSpace(appCtx, group)
-                setGroupState(group, "自动转码拼接中…（较慢，约为视频时长）", null)
+                checkInternalDiskSpace(appCtx, items)
                 try {
-                    val codec = transcodeConcat(appCtx, items, infos, outUri) { msg ->
-                        setGroupState(group, msg, null)
+                    val result = transcodeConcat(appCtx, items, infos, outUri, settings) { p ->
+                        publish(group, p)
                     }
-                    val codecName = when (codec) { "h265" -> "H.265"; "av1" -> "AV1"; else -> "H.264" }
-                    setGroupState(group, "✓ 完成（转码拼接，已统一为 $codecName+AAC）", 100)
+                    publishOutput(appCtx, outUri)
+                    val codecName = VideoCodec.ofId(result.codec).display
+                    val hw = if (result.hwEncoded > 0) "，${result.hwEncoded} 段硬件编码" else ""
+                    publish(
+                        group,
+                        GroupProgress(
+                            MergeStage.DONE, percent = 100,
+                            note = "完成（转码拼接，已统一为 $codecName+AAC$hw）"
+                        ),
+                        force = true
+                    )
                     return outUri
                 } catch (c: CancellationException) {
                     throw c
                 } catch (t: Throwable) {
                     android.util.Log.e(TAG, "transcode failed", t)
-                    runCatching { appCtx.contentResolver.delete(outUri, null, null) }
+                    discardOutput(appCtx, outUri)
                     // 引擎级失败如实上报：failureDetail 带上错误码提示、内层原因
                     // 和组内检测（文档承诺过的格式），不再光秃秃一个异常消息
                     throw IllegalStateException(
@@ -1052,111 +1243,89 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             // 只有探测不动的输入才会走到这里（如网页下载/聊天转发的非常规封装）
-            runCatching { appCtx.contentResolver.delete(outUri, null, null) }
+            discardOutput(appCtx, outUri)
             throw IllegalStateException(inconsistentAdvice(infos))
         } catch (c: CancellationException) {
-            runCatching { appCtx.contentResolver.delete(outUri, null, null) }
+            discardOutput(appCtx, outUri)
             throw c
         }
     }
 
-    /**
-     * 磁盘空间预检（成品输出卷）：成品整文件写出，转封装还要先写临时件再整块
-     * 拷贝（峰值约 2×）；素材体积只是下限参考（crf 转码输出可能比源更大）。
-     * 不足时开工前就报清楚，而不是半路 IOException 被误归成"格式不兼容"。
-     */
-    private fun checkDiskSpace(appCtx: Context, group: Group) {
-        val dir = appCtx.getExternalFilesDir(null) ?: Environment.getExternalStorageDirectory() ?: return
-        val available = runCatching { StatFs(dir.path).availableBytes }.getOrDefault(Long.MAX_VALUE)
-        var needBytes = 0L
-        for (item in group.items) {
-            runCatching {
-                appCtx.contentResolver.openFileDescriptor(item.uri, "r")?.use { needBytes += it.statSize }
-            }
-        }
-        needBytes = needBytes * 2 + 200L * 1024 * 1024
-        if (available < needBytes) {
-            throw IllegalStateException(
-                "存储空间不足：本组约需 ${needBytes / (1024 * 1024)}MB，设备可用 ${available / (1024 * 1024)}MB，请清理空间后重试"
-            )
-        }
-    }
-
-    /**
-     * 转码分区的预检：分段中间件（合计约等于成品大小）+ 拼接临时件（再一份）+
-     * 重编放大的余量，峰值约素材的 2.6 倍；写在 cacheDir（内置 data 分区），
-     * 和共享存储不是一个卷，可用空间常差好几倍，必须单独查。
-     */
-    private fun checkInternalDiskSpace(appCtx: Context, group: Group) {
-        val available = runCatching { StatFs(appCtx.cacheDir.path).availableBytes }.getOrDefault(Long.MAX_VALUE)
-        var needBytes = 0L
-        for (item in group.items) {
-            runCatching {
-                appCtx.contentResolver.openFileDescriptor(item.uri, "r")?.use { needBytes += it.statSize }
-            }
-        }
-        needBytes = needBytes * 26 / 10 + 200L * 1024 * 1024
-        if (available < needBytes) {
-            throw IllegalStateException(
-                "存储空间不足（应用数据分区）：本组转码约需 ${needBytes / (1024 * 1024)}MB，" +
-                    "该分区可用 ${available / (1024 * 1024)}MB，请清理空间后重试"
-            )
-        }
-    }
-
-    private fun setGroupState(group: Group, text: String, progress: Int?) {
-        // 拼接已结束时忽略迟到的进度回调：取消 ffmpeg 后其统计回调可能再触发一次，
-        // 把"已停止"覆盖回"自动转码中…"。收尾态（✓ / ✗ / 已停止）总是允许写入。
-        if (!MergeSession.merging && !text.startsWith("✓") && !text.startsWith("✗") && !text.startsWith("已停止")) return
-        MergeSession.states[group] = text to progress
-        MergeSession.notifyChanged()
+    /** 引擎状态入口：统一走会话层，节流与主线程回调都在那里处理 */
+    private fun publish(group: Group, p: GroupProgress, force: Boolean = false) {
+        MergeSession.publish(group, p, force)
     }
 
     /** 把一组状态画到分组卡片上（由 renderSessionUi 在主线程调用） */
-    private fun applyGroupState(group: Group, text: String, progress: Int?) {
+    private fun applyProgress(group: Group, p: GroupProgress) {
         val cv = cardViews[group] ?: return
         cv.statusText.isVisible = true
-        cv.statusText.text = text
-        // 状态胶囊按语义换色：✓ 成功→反色，✗ 失败→红，已停止→灰，其余运行态→中性
-        when {
-            text.startsWith("✓") -> {
-                cv.statusText.setBackgroundResource(R.drawable.pill_success)
-                cv.statusText.setTextColor(ContextCompat.getColor(this, R.color.on_accent_solid))
+        val text = StatusText.oneLine(p)
+        // 只在文案真的变了才 setText：转码期间每次 stats 回调都新建字符串，
+        // 无条件 setText 会让 TextView 反复请求布局
+        if (cv.statusText.text.toString() != text) cv.statusText.text = text
+        if (cv.lastStage != p.stage) {
+            cv.lastStage = p.stage
+            val (bg, color) = when (p.stage) {
+                MergeStage.DONE -> R.drawable.pill_success to R.color.on_accent_solid
+                MergeStage.FAILED -> R.drawable.pill_error to R.color.danger
+                MergeStage.STOPPED -> R.drawable.pill_neutral to R.color.text_disabled
+                else -> R.drawable.pill_info to R.color.text_secondary
             }
-            text.startsWith("✗") -> {
-                cv.statusText.setBackgroundResource(R.drawable.pill_error)
-                cv.statusText.setTextColor(ContextCompat.getColor(this, R.color.danger))
-            }
-            text.startsWith("已停止") -> {
-                cv.statusText.setBackgroundResource(R.drawable.pill_neutral)
-                cv.statusText.setTextColor(ContextCompat.getColor(this, R.color.text_disabled))
-            }
-            else -> {
-                cv.statusText.setBackgroundResource(R.drawable.pill_info)
-                cv.statusText.setTextColor(ContextCompat.getColor(this, R.color.text_secondary))
-            }
+            cv.statusText.setBackgroundResource(bg)
+            cv.statusText.setTextColor(ContextCompat.getColor(this, color))
         }
-        if (progress == null) {
-            cv.progressBar.isVisible = true
-            cv.progressBar.isIndeterminate = true
-        } else if (progress < 0) {
+        if (p.finished) {
             cv.progressBar.isVisible = false
         } else {
             cv.progressBar.isVisible = true
             cv.progressBar.isIndeterminate = false
-            cv.progressBar.progress = progress
+            cv.progressBar.progress = p.percent.coerceIn(0, 100)
+        }
+        applyRowStates(cv, p)
+    }
+
+    /** 行内状态：当前段显示"转码中 37% · 1.8×"，已完成段打勾，未处理段留空 */
+    private fun applyRowStates(cv: CardViews, p: GroupProgress) {
+        val seg = p.seg
+        cv.fileStateViews.forEachIndexed { i, tv ->
+            val want = when {
+                p.stage == MergeStage.DONE -> "✓"
+                p.stage == MergeStage.FAILED || p.stage == MergeStage.STOPPED -> ""
+                seg == null -> ""
+                seg.index == i + 1 -> StatusText.rowText(p) ?: ""
+                seg.index > i + 1 -> "✓"
+                else -> ""
+            }
+            if (tv.text.toString() != want) tv.text = want
+            tv.isVisible = want.isNotEmpty()
+            if (want.isNotEmpty()) {
+                tv.setTextColor(
+                    ContextCompat.getColor(
+                        this,
+                        when {
+                            want == "✓" -> R.color.text_disabled
+                            p.stage == MergeStage.DONE -> R.color.success
+                            else -> R.color.brand_primary
+                        }
+                    )
+                )
+            }
         }
     }
 
     private fun setUiEnabled(enabled: Boolean) {
         btnNewGroup.isEnabled = enabled
         btnStart.isEnabled = enabled
-        fun walk(v: View) {
-            if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
-            v.isEnabled = enabled
-        }
-        walk(containerGroups)
+        btnAlbumPick.isEnabled = enabled
+        // 拼接期间不允许改输出设置：本轮设置已快照，中途改会让直拷段与
+        // 缩放段按不同参数产出，混拼成分辨率不一致的成品
+        btnOutputSettings.isEnabled = enabled
+        btnNightMode.isEnabled = enabled
         containerGroups.alpha = if (enabled) 1f else 0.55f
+        // 卡片内控件按行位置单独算，绝不递归统一置位——旧实现会覆盖首行 ↑ /
+        // 末行 ↓ 的禁用状态，点一下就 swap(items, 0, -1) 崩溃
+        for ((_, cv) in cardViews) cv.applyEnabled(!enabled, this)
     }
 
     /**
