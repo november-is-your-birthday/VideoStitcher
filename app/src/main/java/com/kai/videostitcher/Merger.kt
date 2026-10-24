@@ -56,7 +56,6 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -917,7 +916,9 @@ fun saveTranscodeSettings(context: Context, settings: TranscodeSettings) {
  * 只有真正需要改动的段才重编码，最后 ffmpeg 容器级拼接 + 成品自检。 */
 
 /** 目标画布与帧率：按总时长多数选择，不再无条件取第一段
- *  （首段 4K 会把整组拖进 4K 重编，首段 480p 又会丢掉后面的清晰度） */
+ *  （首段 4K 会把整组拖进 4K 重编，首段 480p 又会丢掉后面的清晰度）。
+ *  fps 只用于码率估算，不进滤镜：转码逐段保留源帧率（可变帧率输出），
+ *  强制对齐多数帧率会把高帧率段压半（2.0.4 修复"拼接后明显卡顿"） */
 data class TranscodePlan(
     val codec: VideoCodec,
     val width: Int,
@@ -1324,8 +1325,8 @@ suspend fun partialTranscodeConcat(
 }
 
 /**
- * 全量转码引擎：逐段独立转码成统一参数（目标取组内按时长多数的画布/帧率，
- * 横竖混向按各自 rotation 烤平），再容器级拼接。
+ * 全量转码引擎：逐段独立转码成统一编码与画布（画布按时长多数；帧率逐段保留、
+ * 成品为可变帧率；横竖混向按各自 rotation 烤平），再容器级拼接。
  * 返回实际使用的视频编码与硬编段数（供完成文案展示）。
  */
 suspend fun transcodeConcat(
@@ -1617,7 +1618,8 @@ private suspend fun videoCopySegment(
 /**
  * 单段转码。旋转交给 ffmpeg 的 autorotate（≥2.7 默认开启）：带旋转元数据的输入会被自动
  * 转正、输出不再携带旋转标记，targetW/H 是探测出的显示方向尺寸，天然对齐。
- * 尺寸/帧率已经一致时跳过对应滤镜：源像素不经历重采样，少一次画质损失还提速。
+ * 尺寸一致时跳过缩放滤镜：源像素不经历重采样，少一次画质损失还提速。
+ * 帧率永远不强制（2.0.4）：见下方滤镜链注释。
  */
 private suspend fun transcodeSegment(
     context: Context,
@@ -1631,8 +1633,6 @@ private suspend fun transcodeSegment(
 ) {
     val input = FFmpegKitConfig.getSafParameterForRead(context, item.uri)
     val dimsMatch = info.width == plan.width && info.height == plan.height
-    val fpsKnown = info.fps > 1f
-    val fpsFilter = fpsKnown && abs(info.fps - plan.fps) >= 0.05f
     val filters = buildList {
         if (!dimsMatch) {
             add("scale=${plan.width}:${plan.height}:force_original_aspect_ratio=decrease")
@@ -1640,7 +1640,10 @@ private suspend fun transcodeSegment(
         }
         // setsar=1 必须保留：不同相机的 SAR 不一致会让播放器把画面拉伸
         add("setsar=1")
-        if (fpsFilter) add("fps=${trimFps(plan.fps)}")
+        // 刻意不加 fps= 滤镜（2.0.4）：它会把帧率偏离"时长多数"的段强制压到
+        // 多数帧率——60fps 素材混进 30fps 组直接丢半帧，成品肉眼可见卡顿。
+        // 逐段保留源时间戳、输出可变帧率即可；无损拼接早已是同一口径
+        // （见 TrackInfo.matchesVideoOnly 上方注释），各播放器均支持
     }.joinToString(",")
     // 无声段补静音轨，保证拼出的成品音轨连续
     val audioIn = if (info.hasAudio) ""
