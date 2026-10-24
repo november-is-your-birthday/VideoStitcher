@@ -56,6 +56,7 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -74,7 +75,7 @@ fun ffmpegAvailable(): Boolean =
 
 /** 录制/转码过程可能被系统杀掉，中间件会留在缓存目录里直到用户手动清理 */
 private val TEMP_PREFIXES = listOf(
-    "转码段_", "混合段_", "转码成品_", "拼接成品_", "转封装临时_", "剥轨_", "音频段_", "concat_"
+    "转码段_", "混合段_", "转码成品_", "拼接成品_", "转封装临时_", "剥轨_", "音频段_", "concat_", "带内拼接"
 )
 
 /** 启动时清掉上次进程被杀残留的中间件（只动本应用命名的临时文件） */
@@ -112,7 +113,13 @@ data class TrackInfo(
     /** 是否带 B 帧（解码序 PTS 出现回退即判定）：带 B 帧的直拷段过 MPEG-TS
      *  中转拼接时边界时戳易错乱（ffmpeg concat 已知问题，lossless-cut #3057），
      *  引擎链据此回避危险组合 */
-    val hasBFrames: Boolean = false
+    val hasBFrames: Boolean = false,
+    /** 2.0.5：视频/音频轨各自的时长（µs→ms）。不少文件的音轨比视频轨长/短零点几秒
+     *  （相机停机、剪辑导出、流式下载），而拼接按**各轨自身时长**顺次累加时间轴，
+     *  段间音画错位会逐段累积成秒级口型不同步；这两个值用于把每段音轨对齐到
+     *  视频轨（见 [audioAlignArgs]），durationMs 也改为优先取视频轨 */
+    val videoDurationMs: Long = 0,
+    val audioDurationMs: Long = 0
 ) {
     /** 视频流参数是否一致（不含音频）：解码配置字节（csd-0 = avcC/hvcC）一致时，
      *  profile/level/VUI 全部涵盖，比逐字段比对比更严也更快 */
@@ -456,6 +463,8 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
         var durationMs = 0L
         var bitrate = 0
         var videoIdx = -1
+        var videoTrackMs = 0L
+        var audioTrackMs = 0L
         for (i in 0 until extractor.trackCount) {
             val format = extractor.getTrackFormat(i)
             val mime = format.getString(MediaFormat.KEY_MIME)
@@ -471,6 +480,8 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
             if (mime.startsWith("video/") && videoMime == null) {
                 videoIdx = i
                 videoMime = mime
+                videoTrackMs = runCatching { format.getLong(MediaFormat.KEY_DURATION) }
+                    .getOrDefault(0L) / 1000
                 var w = if (format.containsKey(MediaFormat.KEY_WIDTH)) format.getInteger(MediaFormat.KEY_WIDTH) else 0
                 var h = if (format.containsKey(MediaFormat.KEY_HEIGHT)) format.getInteger(MediaFormat.KEY_HEIGHT) else 0
                 rotation =
@@ -494,6 +505,8 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
                 csd = format.byteBufferCopy("csd-0")
             } else if (mime.startsWith("audio/") && audioMime == null) {
                 audioMime = mime
+                audioTrackMs = runCatching { format.getLong(MediaFormat.KEY_DURATION) }
+                    .getOrDefault(0L) / 1000
                 sampleRate =
                     if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 0
                 channels =
@@ -504,9 +517,20 @@ fun probeVideo(context: Context, uri: Uri): TrackInfo {
             }
         }
         val bFrames = if (videoIdx >= 0) detectBFrames(extractor, videoIdx) else false
+        // 2.0.5：时长优先取视频轨（上层用它当视频基准/进度权重/自检期望值），
+        // 音轨排在轨道表前面的文件以前会把音轨时长冒充整体时长；两轨都有时取
+        // max（与容器 mvhd 时长口径一致）；都没有才退回首条有值的轨兜底
+        durationMs = when {
+            videoTrackMs > 0 && audioTrackMs > 0 -> maxOf(videoTrackMs, audioTrackMs)
+            videoTrackMs > 0 -> videoTrackMs
+            audioTrackMs > 0 -> audioTrackMs
+            else -> durationMs
+        }
         return TrackInfo(
             videoMime, width, height, rotation, fps, audioMime, sampleRate, channels,
-            audioMime != null, profile, hdr, csd, extraTracks, durationMs, bitrate, audioCsd, bFrames
+            audioMime != null, profile, hdr, csd, extraTracks, durationMs, bitrate, audioCsd, bFrames,
+            videoDurationMs = videoTrackMs,
+            audioDurationMs = audioTrackMs
         )
     } finally {
         extractor.release()
@@ -1095,6 +1119,55 @@ private fun trimFps(fps: Float): String =
     // ffmpeg 滤镜图解析直接失败
     String.format(Locale.US, "%.3f", fps).trimEnd('0').trimEnd('.').ifEmpty { "30" }
 
+/* ---------- 分段音画对齐（2.0.5） ----------
+ * 源文件的音轨常比视频轨长/短零点几秒（相机停机的余音、剪辑导出、流式下载），
+ * 而所有拼接方式都按"各轨自身时长"顺次累加时间轴：第 k 段的音频从 Σ音频时长处
+ * 开始、视频从 Σ视频时长处开始，错位逐段累积，多段拼完就是秒级口型不同步。
+ * 这里在**分段生成时**把每段音轨精确对齐到视频轨末尾。 */
+
+/** 差异在这个范围内视为封装正常抖动，不做处理（避免无谓的截断/重编） */
+internal const val AUDIO_ALIGN_TOLERANCE_MS = 120L
+
+/** 无损直拼（不重编任何东西）可容忍的组内音画偏差总量，超过就改走
+ *  音频重编路径逐段对齐——250ms 约为口型可感知阈值的下限 */
+internal const val AUDIO_DRIFT_LIMIT_MS = 250L
+
+/** 组内音画偏差总量（ms）：两轨时长都已知才计入，用于无损路径的闸门 */
+internal fun audioDriftTotalMs(infos: List<TrackInfo>): Long = infos.sumOf {
+    if (it.videoDurationMs > 0 && it.audioDurationMs > 0)
+        abs(it.audioDurationMs - it.videoDurationMs) else 0L
+}
+
+/** 音轨比视频轨短超过容差：需要 apad 补静音——滤镜要求重编，-c:a copy 做不到，
+ *  调用方要对这类段放弃音频直拷 */
+internal fun audioNeedsPad(info: TrackInfo): Boolean {
+    val v = info.videoDurationMs
+    val a = info.audioDurationMs
+    return v > 0 && a > 0 && a - v < -AUDIO_ALIGN_TOLERANCE_MS
+}
+
+/** 成品自检的期望时长（2.0.5）：音画对齐后成品两条轨都收敛到视频轨时长，
+ *  期望值也要按视频轨累计——音轨超长的素材（如 60s 音轨配 30s 画面）以前会把
+ *  期望值撑大，把对齐后的正常成品误判成"时长不足"；视频轨时长未知才退回条目值 */
+internal fun verifyExpectedDurationMs(items: List<VideoItem>, infos: List<TrackInfo>): Long =
+    items.indices.sumOf { i ->
+        val v = infos.getOrNull(i)?.videoDurationMs ?: 0L
+        if (v > 0) v else items[i].durationMs
+    }
+
+/** 对齐参数（拼进 ffmpeg 命令尾部）：
+ *  · 音轨偏长 → `-t 视频时长` 截掉音频尾巴（视频包全部早于该时刻，绝不受影响）
+ *  · 音轨偏短 → `apad` 无限补静音 + 同一个 `-t` 收口，正好补到视频末尾 */
+internal fun audioAlignArgs(info: TrackInfo): String {
+    val v = info.videoDurationMs
+    val a = info.audioDurationMs
+    if (v <= 0 || a <= 0) return ""
+    val diff = a - v
+    if (diff >= -AUDIO_ALIGN_TOLERANCE_MS && diff <= AUDIO_ALIGN_TOLERANCE_MS) return ""
+    val secs = trimFps(v / 1000f)
+    return if (diff > 0) " -t $secs" else " -af apad -t $secs"
+}
+
 /** 音频统一参数：AAC 48k 立体声 192k。直拷路径只有在全部段都已是这个规格
  *  且解码配置字节一致时才跳过重编（见 canCopyAudio）。 */
 private const val TRANSCODE_AUDIO = "-c:a aac -ar 48000 -ac 2 -b:a 192k"
@@ -1310,7 +1383,7 @@ suspend fun partialTranscodeConcat(
             } finally {
                 outTmp.delete()
             }
-            val expectedDurationMs = items.sumOf { it.durationMs }
+            val expectedDurationMs = verifyExpectedDurationMs(items, infos)
             onProgress(GroupProgress(MergeStage.VERIFY, percent = 98))
             verifyOutputUsable(
                 context, outUri, expectedDurationMs, segmentCheckPoints(items), expectVideo = true
@@ -1418,7 +1491,7 @@ suspend fun transcodeConcat(
             } finally {
                 outTmp.delete()
             }
-            val expectedDurationMs = items.sumOf { it.durationMs }
+            val expectedDurationMs = verifyExpectedDurationMs(items, infos)
             onProgress(GroupProgress(MergeStage.VERIFY, percent = 98))
             // 全量转码同样按段中点抽帧：只抽 10/50/90% 时，中间某段整段花屏会漏过
             verifyOutputUsable(
@@ -1471,9 +1544,11 @@ suspend fun videoCopyConcatAudio(
                 onProgress(driver.tick(i, MergeStage.AUDIO_REDO, 0))
                 val input = FFmpegKitConfig.getSafParameterForRead(context, item.uri)
                 if (infos[i].hasAudio) {
-                    // 只重编音频（-vn 跳过视频解码），秒级完成
+                    // 只重编音频（-vn 跳过视频解码），秒级完成；音画时长不齐时
+                    // 顺带对齐到视频轨（2.0.5），否则音画错位在拼接时逐段累积
+                    val align = audioAlignArgs(infos[i])
                     runFfmpeg(
-                        "-y -i $input -vn $TRANSCODE_AUDIO '${af.absolutePath}'",
+                        "-y -i $input -vn $TRANSCODE_AUDIO$align '${af.absolutePath}'",
                         item.durationMs,
                         af
                     ) { s -> onProgress(driver.tick(i, MergeStage.AUDIO_REDO, s.percent, s)) }
@@ -1510,7 +1585,7 @@ suspend fun videoCopyConcatAudio(
                     for (c in opened) runCatching { c.close() }
                 }
             }
-            val expectedDurationMs = items.sumOf { it.durationMs }
+            val expectedDurationMs = verifyExpectedDurationMs(items, infos)
             onProgress(GroupProgress(MergeStage.VERIFY, percent = 98))
             verifyOutputUsable(
                 context, outUri, expectedDurationMs, segmentCheckPoints(items), expectVideo = true
@@ -1596,7 +1671,9 @@ private suspend fun transcodeWithTiers(
     throw last ?: IllegalStateException("转码失败")
 }
 
-/** 视频直拷段：像素不动，音频按需重编成 AAC 或生成静音，保证各段音轨结构一致 */
+/** 视频直拷段：像素不动，音频按需重编成 AAC 或生成静音，保证各段音轨结构一致。
+ *  2.0.5：音轨与视频轨时长不齐的段在此对齐（-t 截尾 / apad 补静音），否则拼接
+ *  按各轨自身时长累加，音画错位逐段累积 */
 private suspend fun videoCopySegment(
     context: Context,
     item: VideoItem,
@@ -1606,9 +1683,12 @@ private suspend fun videoCopySegment(
     onSample: (Int, FfmpegSample?) -> Unit
 ) {
     val input = FFmpegKitConfig.getSafParameterForRead(context, item.uri)
-    val audioArgs = if (audioCopy && info.hasAudio) "-c:a copy" else TRANSCODE_AUDIO
+    val align = audioAlignArgs(info)
+    // 音轨偏短的段必须重编（apad 是滤镜，-c:a copy 用不了）
+    val audioArgs =
+        if (audioCopy && info.hasAudio && !audioNeedsPad(info)) "-c:a copy" else TRANSCODE_AUDIO
     val cmd = if (info.hasAudio)
-        "-y -i $input -map 0:v:0 -map 0:a:0 -c:v copy $audioArgs -sn -dn '${out.absolutePath}'"
+        "-y -i $input -map 0:v:0 -map 0:a:0 -c:v copy $audioArgs -sn -dn$align '${out.absolutePath}'"
     else
         "-y -i $input -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 " +
             "-map 0:v:0 -map 1:a -shortest -c:v copy $audioArgs -sn -dn '${out.absolutePath}'"
@@ -1648,7 +1728,11 @@ private suspend fun transcodeSegment(
     // 无声段补静音轨，保证拼出的成品音轨连续
     val audioIn = if (info.hasAudio) ""
     else " -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000"
-    val audioArgs = if (audioCopy && info.hasAudio) "-c:a copy" else TRANSCODE_AUDIO
+    // 2.0.5：音轨与视频轨时长不齐时对齐（-t 截尾 / apad 补静音），音轨偏短的段
+    // 放弃音频直拷（apad 需要滤镜）
+    val align = audioAlignArgs(info)
+    val audioArgs =
+        if (audioCopy && info.hasAudio && !audioNeedsPad(info)) "-c:a copy" else TRANSCODE_AUDIO
     // 必须锁流号：ffmpeg 默认按"声道最多"挑音轨，和 probeVideo 记录的第一条不一定是
     // 同一条（双音轨文件会把 AC3 当成可直拷的 AAC 拷进 MP4）；而 -map 0:v 会把封面图
     // 这类附加视频流一起映射，拼出带两条视频轨的段，后面 concat 直接错位
@@ -1660,7 +1744,7 @@ private suspend fun transcodeSegment(
     // 高分辨率源上缩放曾是最长的单线程段
     val decodeOpt = choice.hwDecoder?.let { "-c:v $it " } ?: ""
     val cmd = "-y -filter_threads 0 ${decodeOpt}-i $input$audioIn $maps -vf $filters " +
-        "${choice.videoArgs} $audioArgs -sn -dn '${out.absolutePath}'"
+        "${choice.videoArgs} $audioArgs -sn -dn$align '${out.absolutePath}'"
     runFfmpeg(cmd, item.durationMs, out) { s -> onSample(s.percent, s) }
 }
 

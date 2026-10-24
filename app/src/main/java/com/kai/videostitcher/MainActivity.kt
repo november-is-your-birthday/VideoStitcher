@@ -1003,7 +1003,9 @@ class MainActivity : AppCompatActivity() {
             workItems.forEach { item ->
                 if (item.durationMs <= 0) item.durationMs = probeDuration(appCtx, item.uri)
             }
-            val expectedDurationMs = workItems.sumOf { it.durationMs }
+            // 期望时长按视频轨累计（2.0.5：音画对齐后成品的轨时长都收敛到视频轨），
+            // 视频轨未知的条目退回条目时长
+            val expectedDurationMs = verifyExpectedDurationMs(workItems, infos)
             val mp4Family = workItems.all { isLosslessCapableName(it.name) }
             // mp4parser 容器级追加的硬约束（2.0.0 补齐，两条都是"宁可降一档也不硬拼"）：
             // 1) 只认 avc1/avcC 采样条目：hvc1 克隆会丢 hvcC、写空 stss（成品没画面），
@@ -1041,6 +1043,11 @@ class MainActivity : AppCompatActivity() {
         settings: TranscodeSettings
     ): Uri {
         var outUri = createOutputUri(appCtx, sanitizeFileName("${group.name}_合并.mp4"))
+        // 2.0.5：音画偏差闸门——源文件音轨/视频轨时长不齐（相机停机余音、剪辑导出）
+        // 时，纯容器级直拼（无损/转封装都不重编音频）按各轨自身时长累加时间轴，
+        // 音画错位会逐段累积成口型不同步；偏差总量超阈值就跳过这两级，让后面的
+        // "视频无损+音频重编"或分段引擎把每段音轨对齐到视频轨（audioAlignArgs）
+        val audioDriftMs = audioDriftTotalMs(infos)
         fun resetOutput(): Uri {
             discardOutput(appCtx, outUri)
             return createOutputUri(appCtx, sanitizeFileName("${group.name}_合并.mp4"))
@@ -1053,7 +1060,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         try {
-            if (paramsUniform && mp4parserSafe) {
+            if (paramsUniform && mp4parserSafe && audioDriftMs <= AUDIO_DRIFT_LIMIT_MS) {
                 publish(
                     group,
                     GroupProgress(
@@ -1102,7 +1109,9 @@ class MainActivity : AppCompatActivity() {
             // 无损转封装只处理无旋转元数据的组：转封装走 media3 的序列管线，
             // 对旋转元数据的携带在真机上不可靠（带旋转的组请用 MP4/MOV 原件走
             // 上面的无损拼接，旋转矩阵在容器层原样保留）
-            if (paramsUniform && isMp4MuxCompatible(infos) && infos.all { it.rotation == 0 }) {
+            if (paramsUniform && isMp4MuxCompatible(infos) && infos.all { it.rotation == 0 } &&
+                audioDriftMs <= AUDIO_DRIFT_LIMIT_MS
+            ) {
                 // 参数一致且编码能直封进 MP4（任意容器，含 MKV/WebM/TS/AV1）：
                 // 直接拷贝压缩流换壳，不解码不重编码
                 try {
